@@ -729,6 +729,78 @@ function luna_hub_profile() {
   return $profile;
 }
 
+/* Helpers to normalize Hub data and provide local fallbacks */
+function luna_is_list_array($value) {
+  if (!is_array($value)) return false;
+  if ($value === array()) return true;
+  return array_keys($value) === range(0, count($value) - 1);
+}
+
+function luna_extract_hub_items($payload, $key) {
+  if (!is_array($payload)) return null;
+
+  $sources = array();
+  if (isset($payload[$key])) {
+    $sources[] = $payload[$key];
+  }
+
+  $underscored = '_' . $key;
+  if (isset($payload[$underscored])) {
+    $sources[] = $payload[$underscored];
+  }
+
+  if (isset($payload['content']) && is_array($payload['content']) && isset($payload['content'][$key])) {
+    $sources[] = $payload['content'][$key];
+  }
+
+  foreach ($sources as $source) {
+    if (!is_array($source)) {
+      continue;
+    }
+
+    if (isset($source['items']) && is_array($source['items'])) {
+      return $source['items'];
+    }
+
+    if (luna_is_list_array($source)) {
+      return $source;
+    }
+  }
+
+  return null;
+}
+
+function luna_collect_local_post_type_snapshot($post_type, $limit = 25) {
+  $post_type = sanitize_key($post_type);
+  if (!$post_type) return array();
+
+  $ids = get_posts(array(
+    'post_type'       => $post_type,
+    'post_status'     => array('publish','draft','pending','private'),
+    'numberposts'     => $limit,
+    'orderby'         => 'date',
+    'order'           => 'DESC',
+    'fields'          => 'ids',
+    'suppress_filters'=> true,
+  ));
+
+  if (!is_array($ids)) return array();
+
+  $items = array();
+  foreach ($ids as $pid) {
+    $items[] = array(
+      'id'        => (int) $pid,
+      'title'     => get_the_title($pid),
+      'slug'      => get_post_field('post_name', $pid),
+      'status'    => get_post_status($pid),
+      'date'      => get_post_time('c', true, $pid),
+      'permalink' => get_permalink($pid),
+    );
+  }
+
+  return $items;
+}
+
 /* Build compact facts, prioritizing Hub over local snapshot; no network/probe overrides */
 function luna_profile_facts() {
   $hub     = luna_hub_profile();
@@ -756,28 +828,74 @@ function luna_profile_facts() {
     ? (string)$hub['wordpress']['theme']['name']
     : ( isset($local['wordpress']['theme']['name']) ? (string)$local['wordpress']['theme']['name'] : '' );
 
-  // Content counts (Hub first)
+  // Content counts (Hub first) + fallback to local snapshots
   $pages = 0; $posts = 0;
   if (isset($hub['content']['pages_total'])) $pages = (int)$hub['content']['pages_total'];
   elseif (isset($hub['content']['pages']))   $pages = (int)$hub['content']['pages'];
   if (isset($hub['content']['posts_total'])) $posts = (int)$hub['content']['posts_total'];
   elseif (isset($hub['content']['posts']))   $posts = (int)$hub['content']['posts'];
 
+  $pages_items = luna_extract_hub_items($hub, 'pages');
+  if (!is_array($pages_items)) {
+    $pages_items = luna_collect_local_post_type_snapshot('page');
+  }
+  if ($pages === 0 && is_array($pages_items)) {
+    $pages = count($pages_items);
+  }
+
+  $posts_items = luna_extract_hub_items($hub, 'posts');
+  if (!is_array($posts_items)) {
+    $posts_items = luna_collect_local_post_type_snapshot('post');
+  }
+  if ($posts === 0 && is_array($posts_items)) {
+    $posts = count($posts_items);
+  }
+
   // Users
   $users_total = isset($hub['users']['total']) ? (int)$hub['users']['total'] : 0;
+  if ($users_total === 0 && isset($hub['users']) && is_array($hub['users'])) {
+    $users_total = count($hub['users']);
+  }
+  if ($users_total === 0) {
+    $user_counts = count_users();
+    if (isset($user_counts['total_users'])) {
+      $users_total = (int) $user_counts['total_users'];
+    }
+  }
 
-  // Updates (Hub first; fallback to local counts)
+  $users_items = luna_extract_hub_items($hub, 'users');
+  if (!is_array($users_items)) {
+    $users_items = array();
+  }
+
+  $plugins_items = array();
+  if (isset($hub['plugins']) && is_array($hub['plugins'])) {
+    $plugins_items = $hub['plugins'];
+  } elseif (isset($local['plugins']) && is_array($local['plugins'])) {
+    $plugins_items = $local['plugins'];
+  }
+
+  $themes_items = array();
+  if (isset($hub['themes']) && is_array($hub['themes'])) {
+    $themes_items = $hub['themes'];
+  } elseif (isset($local['themes']) && is_array($local['themes'])) {
+    $themes_items = $local['themes'];
+  }
+
+  // Updates (Hub first; fallback to derived counts)
   $plugin_updates = isset($hub['updates']['plugins_pending']) ? (int)$hub['updates']['plugins_pending'] : 0;
   $theme_updates  = isset($hub['updates']['themes_pending'])  ? (int)$hub['updates']['themes_pending']  : 0;
-  if ($plugin_updates === 0 || $theme_updates === 0) {
-    $pl = isset($local['plugins']) ? $local['plugins'] : array();
-    $th = isset($local['themes'])  ? $local['themes']  : array();
-    if ($plugin_updates === 0) {
-      $c = 0; foreach ($pl as $p) { if (!empty($p['update_available'])) $c++; } $plugin_updates = $c;
-    }
-    if ($theme_updates === 0) {
-      $c = 0; foreach ($th as $t) { if (!empty($t['update_available'])) $c++; } $theme_updates = $c;
-    }
+  if ($plugin_updates === 0 && !empty($plugins_items)) {
+    $c = 0; foreach ($plugins_items as $p) { if (!empty($p['update_available'])) $c++; } $plugin_updates = $c;
+  }
+  if ($theme_updates === 0 && !empty($themes_items)) {
+    $c = 0; foreach ($themes_items as $t) { if (!empty($t['update_available'])) $c++; } $theme_updates = $c;
+  }
+  $core_updates = 0;
+  if (isset($hub['updates']['core_pending'])) {
+    $core_updates = (int) $hub['updates']['core_pending'];
+  } elseif (!empty($local['wordpress']['core_update_available'])) {
+    $core_updates = $local['wordpress']['core_update_available'] ? 1 : 0;
   }
 
   $facts = array(
@@ -791,8 +909,17 @@ function luna_profile_facts() {
     'host'       => $host,
     'wp_version' => $wpv,
     'theme'      => $theme,
-    'counts'     => array('pages'=>$pages, 'posts'=>$posts, 'users'=>$users_total),
-    'updates'    => array('plugins'=>$plugin_updates, 'themes'=>$theme_updates),
+    'counts'     => array(
+      'pages'   => $pages,
+      'posts'   => $posts,
+      'users'   => $users_total,
+      'plugins' => is_array($plugins_items) ? count($plugins_items) : 0,
+    ),
+    'updates'    => array(
+      'plugins' => $plugin_updates,
+      'themes'  => $theme_updates,
+      'core'    => $core_updates,
+    ),
     'generated'  => gmdate('c'),
   );
 
@@ -876,33 +1003,146 @@ function luna_profile_facts_comprehensive() {
   
   error_log('[Luna] Successfully fetched comprehensive data: ' . print_r($comprehensive, true));
   
-  // Build enhanced facts from comprehensive data
-  $site_url = isset($comprehensive['home_url']) ? (string)$comprehensive['home_url'] : home_url('/');
-  
-  // Add comprehensive data to facts for AI context
+  // Build enhanced facts from comprehensive data with local fallbacks
+  $local_snapshot = luna_snapshot_system();
+
+  $site_url = isset($comprehensive['home_url']) ? (string) $comprehensive['home_url'] : (isset($local_snapshot['site']['home_url']) ? (string) $local_snapshot['site']['home_url'] : home_url('/'));
+  $https    = isset($comprehensive['https']) ? (bool) $comprehensive['https'] : (isset($local_snapshot['site']['https']) ? (bool) $local_snapshot['site']['https'] : is_ssl());
+  $wp_version = isset($comprehensive['wordpress']['version']) ? (string) $comprehensive['wordpress']['version'] : (isset($local_snapshot['wordpress']['version']) ? (string) $local_snapshot['wordpress']['version'] : '');
+
+  $theme_data = array();
+  if (isset($comprehensive['wordpress']['theme']) && is_array($comprehensive['wordpress']['theme'])) {
+    $theme_data = $comprehensive['wordpress']['theme'];
+  } elseif (isset($local_snapshot['wordpress']['theme']) && is_array($local_snapshot['wordpress']['theme'])) {
+    $theme_data = $local_snapshot['wordpress']['theme'];
+  }
+  $theme_name    = isset($theme_data['name']) ? (string) $theme_data['name'] : '';
+  $theme_version = isset($theme_data['version']) ? (string) $theme_data['version'] : '';
+  $theme_active  = isset($theme_data['is_active']) ? (bool) $theme_data['is_active'] : luna_get_active_theme_status($comprehensive);
+
+  $tls_data = array();
+  if (isset($comprehensive['security']['tls']) && is_array($comprehensive['security']['tls'])) {
+    $tls_data = $comprehensive['security']['tls'];
+  } elseif (isset($comprehensive['tls']) && is_array($comprehensive['tls'])) {
+    $tls_data = $comprehensive['tls'];
+  }
+  $tls_valid   = isset($tls_data['valid']) ? (bool) $tls_data['valid'] : false;
+  $tls_issuer  = isset($tls_data['issuer']) ? (string) $tls_data['issuer'] : '';
+  $tls_expires = '';
+  if (isset($tls_data['expires'])) {
+    $tls_expires = (string) $tls_data['expires'];
+  } elseif (isset($tls_data['expires_at'])) {
+    $tls_expires = (string) $tls_data['expires_at'];
+  } elseif (isset($tls_data['not_after'])) {
+    $tls_expires = (string) $tls_data['not_after'];
+  }
+  $tls_checked = isset($tls_data['checked_at']) ? (string) $tls_data['checked_at'] : '';
+
+  $host = isset($comprehensive['host']) ? (string) $comprehensive['host'] : '';
+  if ($host === '' && isset($comprehensive['hosting']['provider'])) {
+    $host = (string) $comprehensive['hosting']['provider'];
+  }
+
+  $plugins_items = luna_extract_hub_items($comprehensive, 'plugins');
+  if (!is_array($plugins_items)) {
+    $plugins_items = isset($local_snapshot['plugins']) ? $local_snapshot['plugins'] : array();
+  }
+
+  $themes_items = luna_extract_hub_items($comprehensive, 'themes');
+  if (!is_array($themes_items)) {
+    $themes_items = isset($local_snapshot['themes']) ? $local_snapshot['themes'] : array();
+  }
+
+  $pages_items = luna_extract_hub_items($comprehensive, 'pages');
+  if (!is_array($pages_items)) {
+    $pages_items = luna_collect_local_post_type_snapshot('page');
+  }
+
+  $posts_items = luna_extract_hub_items($comprehensive, 'posts');
+  if (!is_array($posts_items)) {
+    $posts_items = luna_collect_local_post_type_snapshot('post');
+  }
+
+  $users_items = luna_extract_hub_items($comprehensive, 'users');
+  if (!is_array($users_items) && isset($comprehensive['users']) && is_array($comprehensive['users'])) {
+    $users_items = $comprehensive['users'];
+  }
+  if (!is_array($users_items)) {
+    $users_items = array();
+  }
+
+  $pages_count = is_array($pages_items) ? count($pages_items) : 0;
+  if ($pages_count === 0 && isset($comprehensive['counts']['pages'])) {
+    $pages_count = (int) $comprehensive['counts']['pages'];
+  } elseif ($pages_count === 0 && isset($comprehensive['content']['pages_total'])) {
+    $pages_count = (int) $comprehensive['content']['pages_total'];
+  }
+
+  $posts_count = is_array($posts_items) ? count($posts_items) : 0;
+  if ($posts_count === 0 && isset($comprehensive['counts']['posts'])) {
+    $posts_count = (int) $comprehensive['counts']['posts'];
+  } elseif ($posts_count === 0 && isset($comprehensive['content']['posts_total'])) {
+    $posts_count = (int) $comprehensive['content']['posts_total'];
+  }
+
+  $users_count = is_array($users_items) ? count($users_items) : 0;
+  if ($users_count === 0 && isset($comprehensive['users_total'])) {
+    $users_count = (int) $comprehensive['users_total'];
+  } elseif ($users_count === 0 && isset($comprehensive['users']) && is_array($comprehensive['users'])) {
+    $users_count = count($comprehensive['users']);
+  }
+
+  $plugins_count = is_array($plugins_items) ? count($plugins_items) : 0;
+
+  $plugin_updates = 0;
+  if (is_array($plugins_items)) {
+    foreach ($plugins_items as $plugin) {
+      if (!empty($plugin['update_available'])) {
+        $plugin_updates++;
+      }
+    }
+  }
+
+  $theme_updates = 0;
+  if (is_array($themes_items)) {
+    foreach ($themes_items as $theme_row) {
+      if (!empty($theme_row['update_available'])) {
+        $theme_updates++;
+      }
+    }
+  }
+
+  $core_updates = 0;
+  if (isset($comprehensive['wordpress']['core_update_available'])) {
+    $core_updates = $comprehensive['wordpress']['core_update_available'] ? 1 : 0;
+  } elseif (!empty($local_snapshot['wordpress']['core_update_available'])) {
+    $core_updates = $local_snapshot['wordpress']['core_update_available'] ? 1 : 0;
+  }
+
   $facts = array(
     'site_url'   => $site_url,
-    'https'      => isset($comprehensive['https']) ? (bool)$comprehensive['https'] : is_ssl(),
-    'wp_version' => isset($comprehensive['wordpress']['version']) ? (string)$comprehensive['wordpress']['version'] : '',
-    'theme'      => isset($comprehensive['wordpress']['theme']['name']) ? (string)$comprehensive['wordpress']['theme']['name'] : '',
-    'theme_version' => isset($comprehensive['wordpress']['theme']['version']) ? (string)$comprehensive['wordpress']['theme']['version'] : '',
-    'theme_active' => isset($comprehensive['wordpress']['theme']['is_active']) ? (bool)$comprehensive['wordpress']['theme']['is_active'] : true,
+    'https'      => $https,
+    'wp_version' => $wp_version,
+    'theme'      => $theme_name,
+    'theme_version' => $theme_version,
+    'theme_active'  => $theme_active,
     'tls'        => array(
-      'valid'    => isset($comprehensive['security']['tls']['valid']) ? (bool)$comprehensive['security']['tls']['valid'] : false,
-      'issuer'   => isset($comprehensive['security']['tls']['issuer']) ? (string)$comprehensive['security']['tls']['issuer'] : '',
-      'expires'  => isset($comprehensive['security']['tls']['expires']) ? (string)$comprehensive['security']['tls']['expires'] : '',
+      'valid'   => $tls_valid,
+      'issuer'  => $tls_issuer,
+      'expires' => $tls_expires,
+      'checked' => $tls_checked,
     ),
-    'host'       => isset($comprehensive['host']) ? (string)$comprehensive['host'] : '',
+    'host'       => $host,
     'counts'     => array(
-      'pages' => isset($comprehensive['_pages']['items']) && is_array($comprehensive['_pages']['items']) ? count($comprehensive['_pages']['items']) : 0,
-      'posts' => isset($comprehensive['_posts']['items']) && is_array($comprehensive['_posts']['items']) ? count($comprehensive['_posts']['items']) : 0,
-      'users' => isset($comprehensive['users']) && is_array($comprehensive['users']) ? count($comprehensive['users']) : 0,
-      'plugins' => isset($comprehensive['plugins']) && is_array($comprehensive['plugins']) ? count($comprehensive['plugins']) : 0,
+      'pages'   => $pages_count,
+      'posts'   => $posts_count,
+      'users'   => $users_count,
+      'plugins' => $plugins_count,
     ),
     'updates'    => array(
-      'plugins' => 0, // Would need to calculate from plugins data
-      'themes' => 0, // Calculate from themes data
-      'core' => isset($comprehensive['wordpress']['core_update_available']) ? ($comprehensive['wordpress']['core_update_available'] ? 1 : 0) : 0
+      'plugins' => $plugin_updates,
+      'themes'  => $theme_updates,
+      'core'    => $core_updates,
     ),
     'generated'  => gmdate('c'),
     'comprehensive' => true, // Flag to indicate this is comprehensive data
@@ -914,24 +1154,26 @@ function luna_profile_facts_comprehensive() {
     'security' => isset($comprehensive['security']) ? $comprehensive['security'] : array(), // Add security data
   );
   
-  // Calculate theme updates
-  if (isset($facts['themes']) && is_array($facts['themes'])) {
-    $theme_updates = 0;
-    foreach ($facts['themes'] as $theme) {
-      if (!empty($theme['update_available'])) {
-        $theme_updates++;
-      }
-    }
-    $facts['updates']['themes'] = $theme_updates;
+  $ga4_info = null;
+  if (isset($comprehensive['ga4_metrics']) && is_array($comprehensive['ga4_metrics'])) {
+    $ga4_info = array(
+      'metrics'        => $comprehensive['ga4_metrics'],
+      'last_synced'    => isset($comprehensive['ga4_last_synced']) ? $comprehensive['ga4_last_synced'] : (isset($comprehensive['last_synced']) ? $comprehensive['last_synced'] : null),
+      'date_range'     => isset($comprehensive['ga4_date_range']) ? $comprehensive['ga4_date_range'] : null,
+      'source_url'     => isset($comprehensive['ga4_source_url']) ? $comprehensive['ga4_source_url'] : (isset($comprehensive['source_url']) ? $comprehensive['source_url'] : null),
+      'property_id'    => isset($comprehensive['ga4_property_id']) ? $comprehensive['ga4_property_id'] : null,
+      'measurement_id' => isset($comprehensive['ga4_measurement_id']) ? $comprehensive['ga4_measurement_id'] : null,
+    );
+    error_log('[Luna] GA4 metrics present in comprehensive payload.');
+  } else {
+    error_log('[Luna] No GA4 metrics in comprehensive payload, attempting data streams fetch.');
+    $ga4_info = luna_fetch_ga4_metrics_from_hub($license);
   }
-  
-  // Calculate plugin updates
-  if (isset($facts['plugins']) && is_array($facts['plugins'])) {
-    $plugin_updates = 0;
-    foreach ($facts['plugins'] as $plugin) {
-      if (!empty($plugin['update_available'])) {
-        $plugin_updates++;
-      }
+
+  if ($ga4_info && isset($ga4_info['metrics'])) {
+    $facts['ga4_metrics'] = $ga4_info['metrics'];
+    if (!empty($ga4_info['last_synced'])) {
+      $facts['ga4_last_synced'] = $ga4_info['last_synced'];
     }
     $facts['updates']['plugins'] = $plugin_updates;
   }
