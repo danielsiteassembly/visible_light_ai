@@ -2646,65 +2646,170 @@ final class VL_License_Manager {
      * @param array $license The license record
      * @return string HTML content for GA4 integration
      */
+
     public static function render_ga4_integration($license) {
         $license_key = $license['key'] ?? '';
         $ga4_settings = get_option('vl_ga4_settings_' . $license_key, array());
-        
+
         $html = '<div class="vl-ga4-integration" style="background: white; padding: 20px; border: 1px solid #ddd; border-radius: 5px; margin-bottom: 20px;">';
         $html .= '<h4 style="margin-top: 0; color: #0073aa;">Google Analytics 4 Integration</h4>';
-        
-        // Handle GA4 settings save
+
+        $messages = array();
+        $previous_settings = $ga4_settings;
+
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_ga4_settings']) && check_admin_referer('vl_ga4_nonce')) {
             $ga4_settings = array(
-                'ga4_property_id' => sanitize_text_field($_POST['ga4_property_id']),
-                'ga4_measurement_id' => sanitize_text_field($_POST['ga4_measurement_id']),
-                'ga4_api_key' => sanitize_text_field($_POST['ga4_api_key']),
-                'ga4_enabled' => isset($_POST['ga4_enabled']) ? true : false,
-                'ga4_credentials' => sanitize_text_field($_POST['ga4_credentials'] ?? ''),
-                'last_updated' => current_time('mysql')
+                'ga4_property_id' => sanitize_text_field($_POST['ga4_property_id'] ?? ''),
+                'ga4_measurement_id' => sanitize_text_field($_POST['ga4_measurement_id'] ?? ''),
+                'ga4_api_key' => sanitize_text_field($_POST['ga4_api_key'] ?? ''),
+                'ga4_enabled' => isset($_POST['ga4_enabled']),
+                'ga4_credentials' => self::sanitize_ga4_credentials_input($_POST['ga4_credentials'] ?? ''),
             );
-            update_option('vl_ga4_settings_' . $license_key, $ga4_settings);
-            
-            // Test GA4 authentication
-            $auth_result = self::test_ga4_authentication($ga4_settings);
-            if ($auth_result['success']) {
-                $html .= '<div class="notice notice-success"><p>GA4 settings saved and authentication successful!</p></div>';
+
+            if (isset($previous_settings['last_synced'])) {
+                $ga4_settings['last_synced'] = $previous_settings['last_synced'];
+            }
+
+            if (!empty($license_key) && !empty($previous_settings['ga4_property_id']) && $previous_settings['ga4_property_id'] !== $ga4_settings['ga4_property_id']) {
+                self::remove_ga4_stream($license_key, $previous_settings['ga4_property_id']);
+            }
+
+            if (!empty($ga4_settings['ga4_enabled'])) {
+                if (empty($ga4_settings['ga4_property_id']) || empty($ga4_settings['ga4_api_key'])) {
+                    $ga4_settings['ga4_enabled'] = false;
+                    $ga4_settings['last_synced'] = '';
+                    $messages[] = '<div class="notice notice-error"><p>' . esc_html__('GA4 Property ID and API Key are required to enable the integration.', 'visible-light') . '</p></div>';
+                    if (!empty($previous_settings['ga4_property_id'])) {
+                        self::remove_ga4_stream($license_key, $previous_settings['ga4_property_id']);
+                    }
+                } else {
+                    $report = self::fetch_ga4_report($ga4_settings);
+                    if ($report['success']) {
+                        $sync_time = current_time('mysql');
+                        $ga4_settings['last_synced'] = $sync_time;
+                        self::store_ga4_stream($license_key, $ga4_settings, $report, $sync_time);
+                        $messages[] = '<div class="notice notice-success"><p>' . esc_html__('GA4 settings saved and data synchronized successfully.', 'visible-light') . '</p></div>';
+                        if ((int) $report['rowCount'] === 0 && empty(array_filter($report['metrics']))) {
+                            $messages[] = '<div class="notice notice-warning"><p>' . esc_html__('The GA4 connection succeeded but no data was returned for the selected date range.', 'visible-light') . '</p></div>';
+                        }
+                    } else {
+                        $messages[] = '<div class="notice notice-error"><p>' . sprintf(esc_html__('GA4 settings saved but data sync failed: %s', 'visible-light'), esc_html($report['error'])) . '</p></div>';
+                    }
+                }
             } else {
-                $html .= '<div class="notice notice-error"><p>GA4 settings saved but authentication failed: ' . esc_html($auth_result['error']) . '</p></div>';
+                $ga4_settings['last_synced'] = '';
+                if (!empty($previous_settings['ga4_property_id'])) {
+                    self::remove_ga4_stream($license_key, $previous_settings['ga4_property_id']);
+                }
+                $messages[] = '<div class="notice notice-info"><p>' . esc_html__('GA4 integration disabled for this license.', 'visible-light') . '</p></div>';
+            }
+
+            update_option('vl_ga4_settings_' . $license_key, $ga4_settings);
+        }
+
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST'
+            && !empty($license_key)
+            && !empty($ga4_settings['ga4_enabled'])
+            && !empty($ga4_settings['ga4_property_id'])
+            && !empty($ga4_settings['ga4_api_key'])) {
+            $last_synced_time = !empty($ga4_settings['last_synced']) ? strtotime($ga4_settings['last_synced']) : 0;
+            $needs_refresh = !$last_synced_time || (current_time('timestamp') - $last_synced_time) > 6 * HOUR_IN_SECONDS;
+            if ($needs_refresh) {
+                $report = self::fetch_ga4_report($ga4_settings);
+                if ($report['success']) {
+                    $sync_time = current_time('mysql');
+                    $ga4_settings['last_synced'] = $sync_time;
+                    update_option('vl_ga4_settings_' . $license_key, $ga4_settings);
+                    self::store_ga4_stream($license_key, $ga4_settings, $report, $sync_time);
+                }
             }
         }
-        
+
+        if (!empty($messages)) {
+            foreach ($messages as $message_html) {
+                $html .= $message_html;
+            }
+        }
+
         $html .= '<form method="post">';
         $html .= wp_nonce_field('vl_ga4_nonce', '_wpnonce', true, false);
         $html .= '<table class="form-table">';
-        $html .= '<tr><th scope="row">Enable GA4 Integration</th>';
-        $html .= '<td><label><input type="checkbox" name="ga4_enabled" value="1" ' . checked(isset($ga4_settings['ga4_enabled']) ? $ga4_settings['ga4_enabled'] : false, true, false) . '> Enable Google Analytics 4 integration</label></td></tr>';
-        $html .= '<tr><th scope="row">GA4 Property ID</th>';
-        $html .= '<td><input type="text" name="ga4_property_id" value="' . esc_attr(isset($ga4_settings['ga4_property_id']) ? $ga4_settings['ga4_property_id'] : '') . '" class="regular-text" placeholder="123456789"></td></tr>';
-        $html .= '<tr><th scope="row">Measurement ID</th>';
-        $html .= '<td><input type="text" name="ga4_measurement_id" value="' . esc_attr(isset($ga4_settings['ga4_measurement_id']) ? $ga4_settings['ga4_measurement_id'] : '') . '" class="regular-text" placeholder="G-XXXXXXXXXX"></td></tr>';
-        $html .= '<tr><th scope="row">API Key</th>';
-        $html .= '<td><input type="password" name="ga4_api_key" value="' . esc_attr(isset($ga4_settings['ga4_api_key']) ? $ga4_settings['ga4_api_key'] : '') . '" class="regular-text" placeholder="Your GA4 API Key"></td></tr>';
-        $html .= '<tr><th scope="row">Service Account JSON</th>';
-        $html .= '<td><textarea name="ga4_credentials" class="large-text" rows="4" placeholder="Paste your GA4 Service Account JSON credentials here">' . esc_textarea(isset($ga4_settings['ga4_credentials']) ? $ga4_settings['ga4_credentials'] : '') . '</textarea></td></tr>';
+        $html .= '<tr><th scope="row">' . esc_html__('Enable GA4 Integration', 'visible-light') . '</th>';
+        $html .= '<td><label><input type="checkbox" name="ga4_enabled" value="1" ' . checked(!empty($ga4_settings['ga4_enabled']), true, false) . '> ' . esc_html__('Enable Google Analytics 4 integration', 'visible-light') . '</label></td></tr>';
+        $html .= '<tr><th scope="row">' . esc_html__('GA4 Property ID', 'visible-light') . '</th>';
+        $html .= '<td><input type="text" name="ga4_property_id" value="' . esc_attr($ga4_settings['ga4_property_id'] ?? '') . '" class="regular-text" placeholder="123456789"></td></tr>';
+        $html .= '<tr><th scope="row">' . esc_html__('Measurement ID', 'visible-light') . '</th>';
+        $html .= '<td><input type="text" name="ga4_measurement_id" value="' . esc_attr($ga4_settings['ga4_measurement_id'] ?? '') . '" class="regular-text" placeholder="G-XXXXXXXXXX"></td></tr>';
+        $html .= '<tr><th scope="row">' . esc_html__('API Key', 'visible-light') . '</th>';
+        $html .= '<td><input type="password" name="ga4_api_key" value="' . esc_attr($ga4_settings['ga4_api_key'] ?? '') . '" class="regular-text" placeholder="Your GA4 API Key"></td></tr>';
+        $html .= '<tr><th scope="row">' . esc_html__('Service Account JSON', 'visible-light') . '</th>';
+        $html .= '<td><textarea name="ga4_credentials" class="large-text" rows="4" placeholder="' . esc_attr__('Paste your GA4 Service Account JSON credentials here', 'visible-light') . '">' . esc_textarea($ga4_settings['ga4_credentials'] ?? '') . '</textarea></td></tr>';
         $html .= '</table>';
-        $html .= '<p class="submit"><input type="submit" name="save_ga4_settings" class="button-primary" value="Save GA4 Settings"></p>';
+        $html .= '<p class="submit"><input type="submit" name="save_ga4_settings" class="button-primary" value="' . esc_attr__('Save GA4 Settings', 'visible-light') . '"></p>';
         $html .= '</form>';
-        
-        // Show authentication status
+
+        $ga4_stream = self::get_ga4_stream_data($license_key, $ga4_settings['ga4_property_id'] ?? '');
+
         if (!empty($ga4_settings['ga4_enabled'])) {
-            $auth_status = self::get_ga4_auth_status($ga4_settings);
-            $html .= '<div class="vl-ga4-status" style="margin-top: 15px; padding: 10px; background: ' . ($auth_status['authenticated'] ? '#d4edda' : '#f8d7da') . '; border: 1px solid ' . ($auth_status['authenticated'] ? '#c3e6cb' : '#f5c6cb') . '; border-radius: 4px;">';
-            $html .= '<strong>Authentication Status:</strong> ' . ($auth_status['authenticated'] ? 'Connected' : 'Not Connected');
+            $auth_status = self::get_ga4_auth_status($ga4_settings, $license_key);
+            $status_color = $auth_status['authenticated'] ? '#d4edda' : '#f8d7da';
+            $status_border = $auth_status['authenticated'] ? '#c3e6cb' : '#f5c6cb';
+            $html .= '<div class="vl-ga4-status" style="margin-top: 15px; padding: 10px; background: ' . esc_attr($status_color) . '; border: 1px solid ' . esc_attr($status_border) . '; border-radius: 4px;">';
+            $html .= '<strong>' . esc_html__('Authentication Status:', 'visible-light') . '</strong> ' . ($auth_status['authenticated'] ? esc_html__('Connected', 'visible-light') : esc_html__('Not Connected', 'visible-light'));
+            if (!empty($auth_status['last_synced'])) {
+                $timestamp = strtotime($auth_status['last_synced']);
+                if ($timestamp) {
+                    $html .= '<br><small>' . esc_html__('Last synced:', 'visible-light') . ' ' . esc_html(date_i18n(get_option('date_format') . ' ' . get_option('time_format'), $timestamp)) . '</small>';
+                }
+            }
             if (!$auth_status['authenticated'] && !empty($auth_status['error'])) {
-                $html .= '<br><small>Error: ' . esc_html($auth_status['error']) . '</small>';
+                $html .= '<br><small>' . esc_html__('Error:', 'visible-light') . ' ' . esc_html($auth_status['error']) . '</small>';
             }
             $html .= '</div>';
         }
-        
+
+        if ($ga4_stream && !empty($ga4_stream['ga4_metrics'])) {
+            $html .= '<div class="vl-ga4-latest" style="margin-top: 20px; background: #f9f9f9; border: 1px solid #ddd; border-radius: 5px; padding: 15px;">';
+            $html .= '<h5 style="margin-top: 0;">' . esc_html__('Latest GA4 Metrics', 'visible-light') . '</h5>';
+
+            $summary_parts = array();
+            if (!empty($ga4_stream['ga4_property_id'])) {
+                $summary_parts[] = sprintf(esc_html__('Property ID: %s', 'visible-light'), esc_html($ga4_stream['ga4_property_id']));
+            }
+            if (!empty($ga4_stream['ga4_measurement_id'])) {
+                $summary_parts[] = sprintf(esc_html__('Measurement ID: %s', 'visible-light'), esc_html($ga4_stream['ga4_measurement_id']));
+            }
+            if (!empty($summary_parts)) {
+                $html .= '<p class="description" style="margin-bottom: 10px;">' . implode(' • ', $summary_parts) . '</p>';
+            }
+
+            if (!empty($ga4_stream['ga4_date_range'])) {
+                $range_label = self::describe_ga4_date_range($ga4_stream['ga4_date_range']);
+                if (!empty($range_label)) {
+                    $html .= '<p class="description" style="margin-top: 0;">' . sprintf(esc_html__('Reporting range: %s', 'visible-light'), esc_html($range_label)) . '</p>';
+                }
+            }
+
+            $html .= '<table class="widefat fixed striped" style="margin-top: 10px;">';
+            $html .= '<tbody>';
+            foreach (self::get_ga4_metric_definitions() as $metric_key => $metric_label) {
+                $value = $ga4_stream['ga4_metrics'][$metric_key] ?? 0;
+                $html .= '<tr><th scope="row" style="width: 40%;">' . esc_html($metric_label) . '</th><td>' . esc_html(number_format_i18n((float) $value)) . '</td></tr>';
+            }
+            $html .= '</tbody>';
+            $html .= '</table>';
+
+            if (!empty($ga4_stream['source_url'])) {
+                $html .= '<p style="margin-top: 10px;"><a href="' . esc_url($ga4_stream['source_url']) . '" target="_blank" rel="noopener noreferrer">' . esc_html__('Open in Google Analytics', 'visible-light') . '</a></p>';
+            }
+
+            $html .= '</div>';
+        }
+
         $html .= '</div>';
         return $html;
     }
+
 
     /**
      * Tests GA4 authentication with provided credentials.
@@ -2712,63 +2817,426 @@ final class VL_License_Manager {
      * @param array $ga4_settings GA4 configuration
      * @return array Authentication result
      */
+
     public static function test_ga4_authentication($ga4_settings) {
         if (empty($ga4_settings['ga4_property_id']) || empty($ga4_settings['ga4_api_key'])) {
-            return array('success' => false, 'error' => 'Missing required GA4 credentials');
+            return array('success' => false, 'error' => __('Missing required GA4 credentials.', 'visible-light'));
         }
-        
-        // Test GA4 API connection
-        $url = 'https://analyticsdata.googleapis.com/v1beta/properties/' . $ga4_settings['ga4_property_id'] . ':runReport';
-        $headers = array(
-            'Authorization' => 'Bearer ' . $ga4_settings['ga4_api_key'],
-            'Content-Type' => 'application/json'
+
+        $result = self::fetch_ga4_report($ga4_settings);
+        if ($result['success']) {
+            return array('success' => true, 'message' => __('GA4 authentication successful', 'visible-light'));
+        }
+
+        return array('success' => false, 'error' => $result['error']);
+    }
+
+    public static function get_ga4_auth_status($ga4_settings, $license_key = '') {
+        if (empty($ga4_settings['ga4_enabled'])) {
+            return array('authenticated' => false, 'error' => __('GA4 integration disabled', 'visible-light'), 'last_synced' => '');
+        }
+
+        $status = array(
+            'authenticated' => false,
+            'error' => '',
+            'last_synced' => '',
         );
-        
-        $body = json_encode(array(
+
+        if (!empty($license_key) && !empty($ga4_settings['ga4_property_id'])) {
+            $stream = self::get_ga4_stream_data($license_key, $ga4_settings['ga4_property_id']);
+            if ($stream) {
+                $status['authenticated'] = true;
+                if (!empty($ga4_settings['last_synced'])) {
+                    $status['last_synced'] = $ga4_settings['last_synced'];
+                } elseif (!empty($stream['ga4_last_synced'])) {
+                    $status['last_synced'] = $stream['ga4_last_synced'];
+                } elseif (!empty($stream['last_updated'])) {
+                    $status['last_synced'] = $stream['last_updated'];
+                }
+                return $status;
+            }
+        }
+
+        $auth_result = self::test_ga4_authentication($ga4_settings);
+        $status['authenticated'] = $auth_result['success'];
+        $status['error'] = $auth_result['success'] ? '' : $auth_result['error'];
+
+        if (!empty($ga4_settings['last_synced'])) {
+            $status['last_synced'] = $ga4_settings['last_synced'];
+        }
+
+        return $status;
+    }
+
+    private static function sanitize_ga4_credentials_input($raw_credentials) {
+        if (empty($raw_credentials)) {
+            return '';
+        }
+
+        $raw_credentials = wp_unslash($raw_credentials);
+        if (!is_string($raw_credentials)) {
+            return '';
+        }
+
+        $raw_credentials = trim($raw_credentials);
+        if ($raw_credentials === '') {
+            return '';
+        }
+
+        $decoded = json_decode($raw_credentials, true);
+        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+            return wp_json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        }
+
+        return sanitize_textarea_field($raw_credentials);
+    }
+
+    private static function fetch_ga4_report($ga4_settings) {
+        $metrics_map = self::get_ga4_metric_definitions();
+        $metric_keys = array_keys($metrics_map);
+        $request_body = array(
             'dateRanges' => array(
-                array('startDate' => '7daysAgo', 'endDate' => 'today')
+                array(
+                    'startDate' => '28daysAgo',
+                    'endDate' => 'yesterday',
+                ),
             ),
-            'dimensions' => array(array('name' => 'date')),
-            'metrics' => array(array('name' => 'sessions'))
-        ));
-        
-        $response = wp_remote_post($url, array(
-            'headers' => $headers,
-            'body' => $body,
-            'timeout' => 10
-        ));
-        
+            'metrics' => array(),
+        );
+
+        foreach ($metric_keys as $metric_name) {
+            $request_body['metrics'][] = array('name' => $metric_name);
+        }
+
+        $response = self::make_ga4_request($ga4_settings, $request_body);
         if (is_wp_error($response)) {
             return array('success' => false, 'error' => $response->get_error_message());
         }
-        
-        $response_code = wp_remote_retrieve_response_code($response);
-        if ($response_code === 200) {
-            return array('success' => true, 'message' => 'GA4 authentication successful');
+
+        $decoded = $response['body'];
+
+        if (!is_array($decoded)) {
+            return array('success' => false, 'error' => __('Invalid response from the GA4 API.', 'visible-light'));
+        }
+
+        $metrics = array();
+        foreach ($metric_keys as $metric_name) {
+            $metrics[$metric_name] = 0.0;
+        }
+
+        if (!empty($decoded['rows'][0]['metricValues'])) {
+            foreach ($metric_keys as $index => $metric_name) {
+                $metrics[$metric_name] = isset($decoded['rows'][0]['metricValues'][$index]['value'])
+                    ? (float) $decoded['rows'][0]['metricValues'][$index]['value']
+                    : 0.0;
+            }
+        } elseif (!empty($decoded['totals'][0]['metricValues'])) {
+            foreach ($metric_keys as $index => $metric_name) {
+                $metrics[$metric_name] = isset($decoded['totals'][0]['metricValues'][$index]['value'])
+                    ? (float) $decoded['totals'][0]['metricValues'][$index]['value']
+                    : 0.0;
+            }
+        }
+
+        $row_count = isset($decoded['rowCount']) ? (int) $decoded['rowCount'] : 0;
+        $rows = array();
+        if (!empty($decoded['rows']) && is_array($decoded['rows'])) {
+            $rows = $decoded['rows'];
+        }
+
+        return array(
+            'success' => true,
+            'metrics' => $metrics,
+            'rowCount' => $row_count,
+            'rows' => $rows,
+            'dateRange' => $request_body['dateRanges'][0],
+        );
+    }
+
+    private static function make_ga4_request($ga4_settings, $request_body) {
+        $property_id = trim($ga4_settings['ga4_property_id'] ?? '');
+        $api_key = trim($ga4_settings['ga4_api_key'] ?? '');
+
+        if ($property_id === '' || $api_key === '') {
+            return new WP_Error('ga4_missing_credentials', __('Missing GA4 Property ID or API Key.', 'visible-light'));
+        }
+
+        $url = 'https://analyticsdata.googleapis.com/v1beta/properties/' . rawurlencode($property_id) . ':runReport';
+        $url = add_query_arg('key', rawurlencode($api_key), $url);
+
+        $headers = array(
+            'Content-Type' => 'application/json',
+        );
+
+        if (!empty($ga4_settings['ga4_credentials'])) {
+            $token_result = self::get_service_account_access_token($ga4_settings['ga4_credentials']);
+            if (is_wp_error($token_result)) {
+                return $token_result;
+            }
+            $headers['Authorization'] = 'Bearer ' . $token_result['access_token'];
+        }
+
+        $response = wp_remote_post($url, array(
+            'headers' => $headers,
+            'body' => wp_json_encode($request_body),
+            'timeout' => 20,
+        ));
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+
+        $decoded = json_decode($body, true);
+        if ($decoded === null && trim($body) !== '') {
+            return new WP_Error('ga4_invalid_response', __('Unable to parse GA4 API response.', 'visible-light'));
+        }
+
+        if ($code >= 200 && $code < 300 && empty($decoded['error'])) {
+            return array(
+                'body' => is_array($decoded) ? $decoded : array(),
+                'code' => $code,
+            );
+        }
+
+        $error_message = __('Unknown error communicating with the GA4 API.', 'visible-light');
+        if (!empty($decoded['error']['message'])) {
+            $error_message = $decoded['error']['message'];
+        } elseif ($code >= 400) {
+            $error_message = sprintf(__('GA4 API returned HTTP %d.', 'visible-light'), $code);
+        }
+
+        return new WP_Error('ga4_api_error', $error_message);
+    }
+
+    private static function get_service_account_access_token($credentials_json) {
+        $decoded = json_decode($credentials_json, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+            return new WP_Error('ga4_invalid_credentials', __('Invalid GA4 service account credentials JSON.', 'visible-light'));
+        }
+
+        if (empty($decoded['client_email']) || empty($decoded['private_key'])) {
+            return new WP_Error('ga4_incomplete_credentials', __('The GA4 service account credentials are missing required fields.', 'visible-light'));
+        }
+
+        if (!function_exists('openssl_sign')) {
+            return new WP_Error('ga4_missing_openssl', __('The OpenSSL PHP extension is required for GA4 service account authentication.', 'visible-light'));
+        }
+
+        $token_uri = !empty($decoded['token_uri']) ? $decoded['token_uri'] : 'https://oauth2.googleapis.com/token';
+        $now = time();
+        $payload = array(
+            'iss' => $decoded['client_email'],
+            'scope' => 'https://www.googleapis.com/auth/analytics.readonly',
+            'aud' => $token_uri,
+            'exp' => $now + 3600,
+            'iat' => $now,
+        );
+        $header = array(
+            'alg' => 'RS256',
+            'typ' => 'JWT',
+        );
+
+        $jwt_segments = array(
+            self::base64url_encode(wp_json_encode($header)),
+            self::base64url_encode(wp_json_encode($payload)),
+        );
+
+        $signing_input = implode('.', $jwt_segments);
+
+        $private_key = openssl_pkey_get_private($decoded['private_key']);
+        if (!$private_key) {
+            return new WP_Error('ga4_private_key', __('Unable to parse the GA4 service account private key.', 'visible-light'));
+        }
+
+        $signature = '';
+        $success = openssl_sign($signing_input, $signature, $private_key, OPENSSL_ALGO_SHA256);
+        openssl_free_key($private_key);
+
+        if (!$success) {
+            return new WP_Error('ga4_signature_failure', __('Unable to sign the GA4 service account token.', 'visible-light'));
+        }
+
+        $jwt = $signing_input . '.' . self::base64url_encode($signature);
+
+        $response = wp_remote_post($token_uri, array(
+            'body' => array(
+                'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                'assertion' => $jwt,
+            ),
+            'timeout' => 20,
+        ));
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($code >= 200 && $code < 300 && isset($body['access_token'])) {
+            return array(
+                'access_token' => $body['access_token'],
+                'expires_in' => isset($body['expires_in']) ? (int) $body['expires_in'] : 3600,
+            );
+        }
+
+        $error_message = '';
+        if (isset($body['error_description'])) {
+            $error_message = $body['error_description'];
+        } elseif (isset($body['error'])) {
+            $error_message = $body['error'];
         } else {
-            $body = wp_remote_retrieve_body($response);
-            $error_data = json_decode($body, true);
-            $error_message = isset($error_data['error']['message']) ? $error_data['error']['message'] : 'Unknown error';
-            return array('success' => false, 'error' => $error_message);
+            $error_message = __('Unable to retrieve GA4 access token.', 'visible-light');
+        }
+
+        return new WP_Error('ga4_token_error', $error_message);
+    }
+
+    private static function base64url_encode($data) {
+        return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+    }
+
+    private static function get_ga4_metric_definitions() {
+        return array(
+            'totalUsers' => __('Total Users', 'visible-light'),
+            'newUsers' => __('New Users', 'visible-light'),
+            'sessions' => __('Sessions', 'visible-light'),
+            'screenPageViews' => __('Page Views', 'visible-light'),
+        );
+    }
+
+    private static function store_ga4_stream($license_key, $ga4_settings, $report_data, $synced_at = null) {
+        if (empty($license_key) || empty($ga4_settings['ga4_property_id'])) {
+            return;
+        }
+
+        $all_streams = self::data_streams_store_get();
+        if (!isset($all_streams[$license_key]) || !is_array($all_streams[$license_key])) {
+            $all_streams[$license_key] = array();
+        }
+
+        $stream_id = self::get_ga4_stream_id($ga4_settings['ga4_property_id']);
+        $timestamp = $synced_at ?: current_time('mysql');
+
+        $metrics = array();
+        foreach ($report_data['metrics'] as $metric_key => $metric_value) {
+            $metrics[$metric_key] = is_numeric($metric_value) ? (float) $metric_value : 0.0;
+        }
+
+        $has_activity = ((int) ($report_data['rowCount'] ?? 0) > 0) || !empty(array_filter($metrics));
+
+        $stream = array(
+            'name' => 'Google Analytics 4',
+            'description' => 'Analytics data pulled from GA4 property ' . $ga4_settings['ga4_property_id'],
+            'categories' => array('analytics'),
+            'health_score' => $has_activity ? 95.0 : 70.0,
+            'error_count' => 0,
+            'warning_count' => 0,
+            'status' => $has_activity ? 'active' : 'pending',
+            'last_updated' => $timestamp,
+            'data_count' => (int) ($report_data['rowCount'] ?? 0),
+            'ga4_property_id' => $ga4_settings['ga4_property_id'],
+            'ga4_metrics' => $metrics,
+            'ga4_last_synced' => $timestamp,
+            'ga4_date_range' => $report_data['dateRange'] ?? array(),
+            'source_url' => 'https://analytics.google.com/analytics/web/#/p' . $ga4_settings['ga4_property_id'],
+        );
+
+        if (!empty($ga4_settings['ga4_measurement_id'])) {
+            $stream['ga4_measurement_id'] = $ga4_settings['ga4_measurement_id'];
+        }
+
+        if (!empty($report_data['rows']) && is_array($report_data['rows'])) {
+            $rows = $report_data['rows'];
+            if (count($rows) > 10) {
+                $rows = array_slice($rows, 0, 10);
+            }
+            $stream['ga4_rows'] = $rows;
+        }
+
+        $all_streams[$license_key][$stream_id] = $stream;
+        self::data_streams_store_set($all_streams);
+    }
+
+    private static function remove_ga4_stream($license_key, $property_id) {
+        if (empty($license_key) || empty($property_id)) {
+            return;
+        }
+
+        $all_streams = self::data_streams_store_get();
+        if (empty($all_streams[$license_key])) {
+            return;
+        }
+
+        $stream_id = self::get_ga4_stream_id($property_id);
+        if (isset($all_streams[$license_key][$stream_id])) {
+            unset($all_streams[$license_key][$stream_id]);
+            self::data_streams_store_set($all_streams);
         }
     }
 
-    /**
-     * Gets GA4 authentication status.
-     * 
-     * @param array $ga4_settings GA4 configuration
-     * @return array Authentication status
-     */
-    public static function get_ga4_auth_status($ga4_settings) {
-        if (empty($ga4_settings['ga4_enabled'])) {
-            return array('authenticated' => false, 'error' => 'GA4 integration disabled');
+    private static function get_ga4_stream_id($property_id) {
+        $clean_id = strtolower(preg_replace('/[^a-zA-Z0-9_\-]/', '_', (string) $property_id));
+        return 'ga4_' . $clean_id;
+    }
+
+    private static function get_ga4_stream_data($license_key, $property_id) {
+        if (empty($license_key) || empty($property_id)) {
+            return null;
         }
-        
-        $auth_result = self::test_ga4_authentication($ga4_settings);
-        return array(
-            'authenticated' => $auth_result['success'],
-            'error' => $auth_result['success'] ? '' : $auth_result['error']
-        );
+
+        $all_streams = self::data_streams_store_get();
+        $stream_id = self::get_ga4_stream_id($property_id);
+
+        return $all_streams[$license_key][$stream_id] ?? null;
+    }
+
+    private static function describe_ga4_date_range($range) {
+        if (empty($range) || !is_array($range)) {
+            return '';
+        }
+
+        $start = self::resolve_ga4_relative_date($range['startDate'] ?? '');
+        $end = self::resolve_ga4_relative_date($range['endDate'] ?? '');
+
+        if (!$start || !$end) {
+            $start_raw = $range['startDate'] ?? '';
+            $end_raw = $range['endDate'] ?? '';
+            if ($start_raw || $end_raw) {
+                return trim($start_raw . ' – ' . $end_raw);
+            }
+            return '';
+        }
+
+        $format = get_option('date_format');
+        return date_i18n($format, $start) . ' – ' . date_i18n($format, $end);
+    }
+
+    private static function resolve_ga4_relative_date($value) {
+        if (empty($value) || !is_string($value)) {
+            return false;
+        }
+
+        $value = trim($value);
+
+        if ($value === 'today') {
+            return current_time('timestamp');
+        }
+
+        if ($value === 'yesterday') {
+            return current_time('timestamp') - DAY_IN_SECONDS;
+        }
+
+        if (preg_match('/^(\d+)daysAgo$/', $value, $matches)) {
+            $days = (int) $matches[1];
+            return current_time('timestamp') - ($days * DAY_IN_SECONDS);
+        }
+
+        $timestamp = strtotime($value);
+        return $timestamp ? $timestamp : false;
     }
 
     /**
