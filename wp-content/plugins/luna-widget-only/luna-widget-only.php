@@ -731,8 +731,9 @@ function luna_hub_profile() {
 
 /* Build compact facts, prioritizing Hub over local snapshot; no network/probe overrides */
 function luna_profile_facts() {
-  $hub   = luna_hub_profile();
-  $local = luna_snapshot_system(); // fallback only
+  $hub     = luna_hub_profile();
+  $local   = luna_snapshot_system(); // fallback only
+  $license = luna_get_license();
 
   $site_url = isset($hub['site']['url']) ? (string)$hub['site']['url'] : home_url('/');
 
@@ -779,7 +780,7 @@ function luna_profile_facts() {
     }
   }
 
-  return array(
+  $facts = array(
     'site_url'   => $site_url,
     'tls'        => array(
       'valid'    => (bool)$tls_valid,
@@ -794,6 +795,30 @@ function luna_profile_facts() {
     'updates'    => array('plugins'=>$plugin_updates, 'themes'=>$theme_updates),
     'generated'  => gmdate('c'),
   );
+
+  if ($license) {
+    $ga4_info = luna_fetch_ga4_metrics_from_hub($license);
+    if ($ga4_info && isset($ga4_info['metrics'])) {
+      $facts['ga4_metrics'] = $ga4_info['metrics'];
+      if (!empty($ga4_info['last_synced'])) {
+        $facts['ga4_last_synced'] = $ga4_info['last_synced'];
+      }
+      if (!empty($ga4_info['date_range'])) {
+        $facts['ga4_date_range'] = $ga4_info['date_range'];
+      }
+      if (!empty($ga4_info['source_url'])) {
+        $facts['ga4_source_url'] = $ga4_info['source_url'];
+      }
+      if (!empty($ga4_info['property_id'])) {
+        $facts['ga4_property_id'] = $ga4_info['property_id'];
+      }
+      if (!empty($ga4_info['measurement_id'])) {
+        $facts['ga4_measurement_id'] = $ga4_info['measurement_id'];
+      }
+    }
+  }
+
+  return $facts;
 }
 
 /* Enhanced facts with comprehensive Hub data */
@@ -887,7 +912,6 @@ function luna_profile_facts_comprehensive() {
     'posts' => isset($comprehensive['_posts']['items']) ? $comprehensive['_posts']['items'] : array(),
     'pages' => isset($comprehensive['_pages']['items']) ? $comprehensive['_pages']['items'] : array(),
     'security' => isset($comprehensive['security']) ? $comprehensive['security'] : array(), // Add security data
-    'ga4_metrics' => isset($comprehensive['ga4_metrics']) ? $comprehensive['ga4_metrics'] : null, // Add GA4 analytics data
   );
   
   // Calculate theme updates
@@ -912,15 +936,46 @@ function luna_profile_facts_comprehensive() {
     $facts['updates']['plugins'] = $plugin_updates;
   }
   
-  // Debug GA4 data extraction
-  if (isset($facts['ga4_metrics'])) {
-    error_log('[Luna] GA4 metrics extracted: ' . print_r($facts['ga4_metrics'], true));
+  $ga4_info = null;
+  if (isset($comprehensive['ga4_metrics']) && is_array($comprehensive['ga4_metrics'])) {
+    $ga4_info = array(
+      'metrics'        => $comprehensive['ga4_metrics'],
+      'last_synced'    => isset($comprehensive['ga4_last_synced']) ? $comprehensive['ga4_last_synced'] : (isset($comprehensive['last_synced']) ? $comprehensive['last_synced'] : null),
+      'date_range'     => isset($comprehensive['ga4_date_range']) ? $comprehensive['ga4_date_range'] : null,
+      'source_url'     => isset($comprehensive['ga4_source_url']) ? $comprehensive['ga4_source_url'] : (isset($comprehensive['source_url']) ? $comprehensive['source_url'] : null),
+      'property_id'    => isset($comprehensive['ga4_property_id']) ? $comprehensive['ga4_property_id'] : null,
+      'measurement_id' => isset($comprehensive['ga4_measurement_id']) ? $comprehensive['ga4_measurement_id'] : null,
+    );
+    error_log('[Luna] GA4 metrics present in comprehensive payload.');
   } else {
-    error_log('[Luna] No GA4 metrics found in comprehensive data');
+    error_log('[Luna] No GA4 metrics in comprehensive payload, attempting data streams fetch.');
+    $ga4_info = luna_fetch_ga4_metrics_from_hub($license);
   }
-  
+
+  if ($ga4_info && isset($ga4_info['metrics'])) {
+    $facts['ga4_metrics'] = $ga4_info['metrics'];
+    if (!empty($ga4_info['last_synced'])) {
+      $facts['ga4_last_synced'] = $ga4_info['last_synced'];
+    }
+    if (!empty($ga4_info['date_range'])) {
+      $facts['ga4_date_range'] = $ga4_info['date_range'];
+    }
+    if (!empty($ga4_info['source_url'])) {
+      $facts['ga4_source_url'] = $ga4_info['source_url'];
+    }
+    if (!empty($ga4_info['property_id'])) {
+      $facts['ga4_property_id'] = $ga4_info['property_id'];
+    }
+    if (!empty($ga4_info['measurement_id'])) {
+      $facts['ga4_measurement_id'] = $ga4_info['measurement_id'];
+    }
+    error_log('[Luna] GA4 metrics hydrated: ' . print_r($facts['ga4_metrics'], true));
+  } else {
+    error_log('[Luna] Unable to hydrate GA4 metrics from Hub.');
+  }
+
   error_log('[Luna] Built comprehensive facts: ' . print_r($facts, true));
-  
+
   return $facts;
 }
 
@@ -3235,8 +3290,11 @@ function luna_sync_keywords_to_hub($mappings) {
 function luna_sync_analytics_to_hub($analytics_data) {
   $license = luna_get_license();
   if (!$license) return;
-  
-  $response = wp_remote_post('https://visiblelight.ai/wp-json/vl-hub/v1/sync-client-data', [
+
+  $endpoint = luna_widget_hub_base() . '/wp-json/vl-hub/v1/sync-client-data';
+  delete_transient('luna_ga4_metrics_' . md5($license));
+
+  $response = wp_remote_post($endpoint, [
     'timeout' => 10,
     'headers' => ['X-Luna-License' => $license, 'Content-Type' => 'application/json'],
     'body' => json_encode([
@@ -3245,18 +3303,122 @@ function luna_sync_analytics_to_hub($analytics_data) {
       'analytics_data' => $analytics_data
     ])
   ]);
-  
+
   if (is_wp_error($response)) {
     error_log('[Luna] Failed to sync analytics to Hub: ' . $response->get_error_message());
   }
+}
+
+// Fetch data streams from Hub and extract GA4 metrics
+function luna_fetch_hub_data_streams($license = null) {
+  if (!$license) {
+    $license = luna_get_license();
+  }
+  if (!$license) return null;
+
+  $base = luna_widget_hub_base();
+  $url  = add_query_arg(array('license' => $license), $base . '/wp-json/vl-hub/v1/data-streams');
+
+  $response = wp_remote_get($url, array(
+    'timeout' => 12,
+    'headers' => array(
+      'X-Luna-License' => $license,
+      'X-Luna-Site'    => home_url('/'),
+      'Accept'         => 'application/json',
+    ),
+    'sslverify' => true,
+  ));
+
+  if (is_wp_error($response)) {
+    error_log('[Luna] Error fetching Hub data streams: ' . $response->get_error_message());
+    return null;
+  }
+
+  $code = (int) wp_remote_retrieve_response_code($response);
+  if ($code < 200 || $code >= 300) {
+    error_log('[Luna] Hub data streams responded with HTTP ' . $code);
+    return null;
+  }
+
+  $body = json_decode(wp_remote_retrieve_body($response), true);
+  if (!is_array($body)) {
+    error_log('[Luna] Hub data streams response was not valid JSON.');
+    return null;
+  }
+
+  $streams_raw = array();
+  if (isset($body['streams']) && is_array($body['streams'])) {
+    $streams_raw = $body['streams'];
+  } else {
+    $streams_raw = $body;
+  }
+
+  $streams = array();
+  foreach ($streams_raw as $stream_id => $stream_data) {
+    if (is_array($stream_data)) {
+      if (!isset($stream_data['_id'])) {
+        $stream_data['_id'] = is_string($stream_id) ? $stream_id : null;
+      }
+      $streams[] = $stream_data;
+    }
+  }
+
+  return $streams;
+}
+
+function luna_extract_ga4_metrics_from_streams($streams) {
+  if (!is_array($streams)) return null;
+
+  foreach ($streams as $stream) {
+    if (!is_array($stream)) continue;
+
+    if (!empty($stream['ga4_metrics']) && is_array($stream['ga4_metrics'])) {
+      return array(
+        'metrics'        => $stream['ga4_metrics'],
+        'last_synced'    => isset($stream['ga4_last_synced']) ? $stream['ga4_last_synced'] : (isset($stream['last_updated']) ? $stream['last_updated'] : null),
+        'date_range'     => isset($stream['ga4_date_range']) ? $stream['ga4_date_range'] : null,
+        'source_url'     => isset($stream['source_url']) ? $stream['source_url'] : null,
+        'property_id'    => isset($stream['ga4_property_id']) ? $stream['ga4_property_id'] : null,
+        'measurement_id' => isset($stream['ga4_measurement_id']) ? $stream['ga4_measurement_id'] : null,
+      );
+    }
+  }
+
+  return null;
+}
+
+function luna_fetch_ga4_metrics_from_hub($license = null) {
+  if (!$license) {
+    $license = luna_get_license();
+  }
+  if (!$license) return null;
+
+  $cache_key = 'luna_ga4_metrics_' . md5($license);
+  $cached    = get_transient($cache_key);
+  if (is_array($cached)) {
+    return $cached;
+  }
+
+  $streams = luna_fetch_hub_data_streams($license);
+  if (!$streams) {
+    return null;
+  }
+
+  $ga4_info = luna_extract_ga4_metrics_from_streams($streams);
+  if ($ga4_info) {
+    set_transient($cache_key, $ga4_info, 5 * MINUTE_IN_SECONDS);
+  }
+
+  return $ga4_info;
 }
 
 // Sync security data to Hub
 function luna_sync_security_to_hub($security_data) {
   $license = luna_get_license();
   if (!$license) return;
-  
-  $response = wp_remote_post('https://visiblelight.ai/wp-json/vl-hub/v1/sync-client-data', [
+
+  $endpoint = luna_widget_hub_base() . '/wp-json/vl-hub/v1/sync-client-data';
+  $response = wp_remote_post($endpoint, [
     'timeout' => 10,
     'headers' => ['X-Luna-License' => $license, 'Content-Type' => 'application/json'],
     'body' => json_encode([
@@ -3275,8 +3437,9 @@ function luna_sync_security_to_hub($security_data) {
 function luna_sync_settings_to_hub($settings_data) {
   $license = luna_get_license();
   if (!$license) return;
-  
-  $response = wp_remote_post('https://visiblelight.ai/wp-json/vl-hub/v1/sync-client-data', [
+
+  $endpoint = luna_widget_hub_base() . '/wp-json/vl-hub/v1/sync-client-data';
+  $response = wp_remote_post($endpoint, [
     'timeout' => 10,
     'headers' => ['X-Luna-License' => $license, 'Content-Type' => 'application/json'],
     'body' => json_encode([
@@ -3297,7 +3460,7 @@ function luna_get_hub_data($category = null) {
   if (!$license) return null;
   
   // Get profile data from VL Hub which includes GA4 analytics
-  $url = 'https://visiblelight.ai/wp-json/vl-hub/v1/profile';
+  $url = luna_widget_hub_base() . '/wp-json/vl-hub/v1/profile';
   $args = ['license' => $license];
   if ($category) {
     $args['category'] = $category;
@@ -5597,54 +5760,113 @@ function luna_send_support_email($email, $prompt, $facts) {
 function luna_handle_analytics_request($prompt, $facts) {
   $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
   $site_name = parse_url($site_url, PHP_URL_HOST);
-  
+
   // Get GA4 data from facts array (same as intelligence report)
   $ga4_metrics = null;
-  
+  $ga4_meta = array(
+    'last_synced'    => isset($facts['ga4_last_synced']) ? $facts['ga4_last_synced'] : null,
+    'date_range'     => isset($facts['ga4_date_range']) ? $facts['ga4_date_range'] : null,
+    'source_url'     => isset($facts['ga4_source_url']) ? $facts['ga4_source_url'] : null,
+    'property_id'    => isset($facts['ga4_property_id']) ? $facts['ga4_property_id'] : null,
+    'measurement_id' => isset($facts['ga4_measurement_id']) ? $facts['ga4_measurement_id'] : null,
+  );
+
   if (isset($facts['ga4_metrics'])) {
     $ga4_metrics = $facts['ga4_metrics'];
   }
-  
+
   // Debug logging
   error_log('[Luna Analytics] Facts keys: ' . implode(', ', array_keys($facts)));
   error_log('[Luna Analytics] GA4 metrics found: ' . ($ga4_metrics ? 'YES' : 'NO'));
   if ($ga4_metrics) {
     error_log('[Luna Analytics] GA4 data: ' . print_r($ga4_metrics, true));
   }
-  
+
+  if (!$ga4_metrics) {
+    error_log('[Luna Analytics] Attempting to fetch GA4 metrics directly from Hub data streams.');
+    $ga4_info = luna_fetch_ga4_metrics_from_hub();
+    if ($ga4_info && isset($ga4_info['metrics'])) {
+      $ga4_metrics = $ga4_info['metrics'];
+      foreach (array('last_synced','date_range','source_url','property_id','measurement_id') as $meta_key) {
+        if (isset($ga4_info[$meta_key]) && empty($ga4_meta[$meta_key])) {
+          $ga4_meta[$meta_key] = $ga4_info[$meta_key];
+        }
+      }
+      error_log('[Luna Analytics] GA4 metrics hydrated from data streams: ' . print_r($ga4_metrics, true));
+    }
+  }
+
   if (!$ga4_metrics) {
     return "I don't have access to your analytics data right now. Your GA4 integration may need to be refreshed. You can check your analytics settings in the Visible Light Hub profile, or I can help you set up Google Analytics if it's not configured yet.";
   }
-  
+
   $lc = strtolower($prompt);
-  
+
   // Handle specific analytics questions
   if (preg_match('/\b(page.*views|pageviews)\b/', $lc)) {
     $page_views = isset($ga4_metrics['screenPageViews']) ? $ga4_metrics['screenPageViews'] : 'N/A';
     return "Your page views for the current period are: **" . $page_views . "** views. This data comes from your Google Analytics 4 integration.";
   }
-  
+
   if (preg_match('/\b(users|visitors)\b/', $lc)) {
     $total_users = isset($ga4_metrics['totalUsers']) ? $ga4_metrics['totalUsers'] : 'N/A';
     $new_users = isset($ga4_metrics['newUsers']) ? $ga4_metrics['newUsers'] : 'N/A';
     return "Your user analytics show:\n• **Total Users**: " . $total_users . "\n• **New Users**: " . $new_users . "\nThis data comes from your Google Analytics 4 integration.";
   }
-  
+
   if (preg_match('/\b(sessions)\b/', $lc)) {
     $sessions = isset($ga4_metrics['sessions']) ? $ga4_metrics['sessions'] : 'N/A';
     return "Your sessions for the current period are: **" . $sessions . "** sessions. This data comes from your Google Analytics 4 integration.";
   }
-  
+
   if (preg_match('/\b(bounce.*rate)\b/', $lc)) {
     $bounce_rate = isset($ga4_metrics['bounceRate']) ? $ga4_metrics['bounceRate'] : 'N/A';
     return "Your bounce rate is: **" . $bounce_rate . "%**. This data comes from your Google Analytics 4 integration.";
   }
-  
+
   if (preg_match('/\b(engagement.*rate|engagement)\b/', $lc)) {
     $engagement_rate = isset($ga4_metrics['engagementRate']) ? $ga4_metrics['engagementRate'] : 'N/A';
     return "Your engagement rate is: **" . $engagement_rate . "%**. This data comes from your Google Analytics 4 integration.";
   }
-  
+
+  if (preg_match('/\b(property\s*id|ga4\s*property)\b/', $lc) && strpos($lc, 'measurement') === false) {
+    if (!empty($ga4_meta['property_id'])) {
+      return "Your Google Analytics 4 property ID is **" . $ga4_meta['property_id'] . "**.";
+    }
+    return "I couldn't find a GA4 property ID in your Hub profile. Double-check the Visible Light Hub analytics settings to confirm it's saved.";
+  }
+
+  if (preg_match('/measurement\s*id/', $lc)) {
+    if (!empty($ga4_meta['measurement_id'])) {
+      return "Your GA4 measurement ID is **" . $ga4_meta['measurement_id'] . "**.";
+    }
+    return "I don't see a GA4 measurement ID recorded yet. Make sure it's configured in your Visible Light Hub analytics settings.";
+  }
+
+  if (preg_match('/(last|recent).*(sync|synced|update|updated|refresh)/', $lc)) {
+    if (!empty($ga4_meta['last_synced'])) {
+      $range_text = '';
+      if (!empty($ga4_meta['date_range']) && is_array($ga4_meta['date_range'])) {
+        $start = isset($ga4_meta['date_range']['startDate']) ? $ga4_meta['date_range']['startDate'] : '';
+        $end   = isset($ga4_meta['date_range']['endDate']) ? $ga4_meta['date_range']['endDate'] : '';
+        if ($start || $end) {
+          $range_text = ' covering ' . trim($start . ' to ' . $end);
+        }
+      }
+      return "Your GA4 metrics were last synced on **" . $ga4_meta['last_synced'] . "**" . $range_text . ".";
+    }
+    return "I wasn't able to confirm the last sync time from the Hub profile. Try refreshing the GA4 connection in Visible Light Hub to capture a new sync timestamp.";
+  }
+
+  if (preg_match('/(date\s*range|time\s*range|timeframe|time\s*frame|reporting\s*period)/', $lc)) {
+    if (!empty($ga4_meta['date_range']) && is_array($ga4_meta['date_range'])) {
+      $start = isset($ga4_meta['date_range']['startDate']) ? $ga4_meta['date_range']['startDate'] : 'unknown start';
+      $end   = isset($ga4_meta['date_range']['endDate']) ? $ga4_meta['date_range']['endDate'] : 'unknown end';
+      return "The current GA4 report covers **" . $start . "** through **" . $end . "**.";
+    }
+    return "I couldn't determine the reporting range. Try re-syncing GA4 from the Visible Light Hub profile to capture a date window.";
+  }
+
   // General analytics summary
   $summary = "Here's your current analytics data from Google Analytics 4:\n\n";
   $summary .= "📊 **Traffic Overview:**\n";
@@ -5655,14 +5877,36 @@ function luna_handle_analytics_request($prompt, $facts) {
   $summary .= "📈 **Engagement Metrics:**\n";
   $summary .= "• **Bounce Rate**: " . (isset($ga4_metrics['bounceRate']) ? $ga4_metrics['bounceRate'] . '%' : 'N/A') . "\n";
   $summary .= "• **Engagement Rate**: " . (isset($ga4_metrics['engagementRate']) ? $ga4_metrics['engagementRate'] . '%' : 'N/A') . "\n";
-  $summary .= "• **Avg Session Duration**: " . (isset($ga4_metrics['averageSessionDuration']) ? $ga4_metrics['averageSessionDuration'] : 'N/A') . "\n\n";
-  
+  $summary .= "• **Avg Session Duration**: " . (isset($ga4_metrics['averageSessionDuration']) ? $ga4_metrics['averageSessionDuration'] : 'N/A') . "\n";
+
   if (isset($ga4_metrics['totalRevenue']) && $ga4_metrics['totalRevenue'] > 0) {
-    $summary .= "💰 **Revenue**: $" . $ga4_metrics['totalRevenue'] . "\n\n";
+    $summary .= "• **Revenue**: $" . $ga4_metrics['totalRevenue'] . "\n";
   }
-  
-  $summary .= "This data is pulled from your Google Analytics 4 integration and updated regularly.";
-  
+
+  if (!empty($ga4_meta['property_id'])) {
+    $summary .= "• **GA4 Property ID**: " . $ga4_meta['property_id'] . "\n";
+  }
+
+  if (!empty($ga4_meta['measurement_id'])) {
+    $summary .= "• **Measurement ID**: " . $ga4_meta['measurement_id'] . "\n";
+  }
+
+  if (!empty($ga4_meta['last_synced'])) {
+    $summary .= "• **Last Synced**: " . $ga4_meta['last_synced'] . "\n";
+  }
+
+  if (!empty($ga4_meta['date_range']) && is_array($ga4_meta['date_range'])) {
+    $start = isset($ga4_meta['date_range']['startDate']) ? $ga4_meta['date_range']['startDate'] : 'unknown start';
+    $end   = isset($ga4_meta['date_range']['endDate']) ? $ga4_meta['date_range']['endDate'] : 'unknown end';
+    $summary .= "• **Reporting Range**: " . $start . " → " . $end . "\n";
+  }
+
+  $summary .= "\nThis data is pulled from your Google Analytics 4 integration and updated regularly.";
+
+  if (!empty($ga4_meta['source_url'])) {
+    $summary .= "\nView more in Google Analytics: " . $ga4_meta['source_url'];
+  }
+
   return $summary;
 }
 
