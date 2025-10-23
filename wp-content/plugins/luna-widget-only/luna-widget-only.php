@@ -192,6 +192,7 @@ function luna_widget_admin_page(){
       <div style="margin-top:6px;display:flex;gap:8px;align-items:center;">
         <button type="button" class="button" id="luna-test-activation">Test Activation</button>
         <button type="button" class="button" id="luna-test-heartbeat">Heartbeat Now</button>
+        <button type="button" class="button button-primary" id="luna-sync-to-hub">Sync to Hub</button>
         <span style="opacity:.8;">Hub: <?php echo esc_html($hub); ?></span>
       </div>
     </div>
@@ -280,6 +281,7 @@ function luna_widget_admin_page(){
       document.addEventListener('click', function(e){
         if(e.target && e.target.id==='luna-test-activation'){ e.preventDefault(); call('<?php echo esc_url_raw( rest_url('luna_widget/v1/ping-hub') ); ?>'); }
         if(e.target && e.target.id==='luna-test-heartbeat'){ e.preventDefault(); call('<?php echo esc_url_raw( rest_url('luna_widget/v1/heartbeat-now') ); ?>'); }
+        if(e.target && e.target.id==='luna-sync-to-hub'){ e.preventDefault(); call('<?php echo esc_url_raw( rest_url('luna_widget/v1/sync-to-hub') ); ?>'); }
       });
     })();
   </script>
@@ -816,14 +818,14 @@ function luna_profile_facts_comprehensive() {
     return luna_profile_facts(); // fallback to basic facts
   }
   
-  // Try to fetch comprehensive data from Hub
+  // Try to fetch comprehensive data from VL Hub profile
   $hub_url = luna_widget_hub_base();
-  $endpoint = $hub_url . '/wp-json/luna_widget/v1/system/comprehensive';
+  $endpoint = $hub_url . '/wp-json/vl-hub/v1/profile';
   
   error_log('[Luna] Fetching comprehensive data from: ' . $endpoint);
   error_log('[Luna] Using license: ' . substr($license, 0, 8) . '...');
   
-  $response = wp_remote_get($endpoint, array(
+  $response = wp_remote_get($endpoint . '?license=' . urlencode($license), array(
     'headers' => array('X-Luna-License' => $license),
     'timeout' => 10
   ));
@@ -885,6 +887,7 @@ function luna_profile_facts_comprehensive() {
     'posts' => isset($comprehensive['_posts']['items']) ? $comprehensive['_posts']['items'] : array(),
     'pages' => isset($comprehensive['_pages']['items']) ? $comprehensive['_pages']['items'] : array(),
     'security' => isset($comprehensive['security']) ? $comprehensive['security'] : array(), // Add security data
+    'ga4_metrics' => isset($comprehensive['ga4_metrics']) ? $comprehensive['ga4_metrics'] : null, // Add GA4 analytics data
   );
   
   // Calculate theme updates
@@ -907,6 +910,13 @@ function luna_profile_facts_comprehensive() {
       }
     }
     $facts['updates']['plugins'] = $plugin_updates;
+  }
+  
+  // Debug GA4 data extraction
+  if (isset($facts['ga4_metrics'])) {
+    error_log('[Luna] GA4 metrics extracted: ' . print_r($facts['ga4_metrics'], true));
+  } else {
+    error_log('[Luna] No GA4 metrics found in comprehensive data');
   }
   
   error_log('[Luna] Built comprehensive facts: ' . print_r($facts, true));
@@ -1572,8 +1582,20 @@ function luna_openai_messages_with_facts($pid, $user_text, $facts) {
   
   $facts_text .= "\nRULES: Prefer the FACTS for this client. If a fact is missing/uncertain, say you're unsure and suggest next steps. Keep answers concise and specific to this site when relevant.";
 
+  // Get additional data from VL Hub
+  $hub_data = luna_get_hub_data();
+  if ($hub_data && isset($hub_data['summary'])) {
+    $facts_text .= "\n\nHUB INSIGHTS:\n" . $hub_data['summary'];
+    if (isset($hub_data['metrics'])) {
+      $facts_text .= "\n\nHUB METRICS:\n";
+      foreach ($hub_data['metrics'] as $key => $value) {
+        $facts_text .= "- " . ucfirst(str_replace('_', ' ', $key)) . ": " . $value . "\n";
+      }
+    }
+  }
+
   $messages = array(
-    array('role'=>'system','content'=>"You are Luna, a concise, friendly assistant for the site’s owners."),
+    array('role'=>'system','content'=>"You are Luna, a concise, friendly assistant for the site's owners."),
     array('role'=>'system','content'=>$facts_text),
   );
   $t = get_post_meta($pid, 'transcript', true);
@@ -1813,7 +1835,13 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
     $answer = "Here are some blog title ideas for your new website: 'Welcome to ".$site_name." - A Fresh Digital Experience', 'Introducing Our New ".$theme_name."-Powered Website', 'Behind the Scenes: Building ".$site_name."', or 'What's New at ".$site_name." - A Complete Redesign'. Would you like me to suggest more specific topics?";
   }
   elseif (preg_match('/\bwhat.*can.*you.*do|\bwhat.*do.*you.*do|\bhelp.*with\b/', $lc)) {
-    $answer = "I can help you with information about your WordPress site, including themes, plugins, SSL status, pages, posts, users, security settings, domain information, and more. All data comes from your Visible Light Hub profile. What would you like to know?";
+    $answer = "I can help you with information about your WordPress site, including themes, plugins, SSL status, pages, posts, users, security settings, domain information, analytics data (page views, users, sessions, bounce rate, engagement), and more. All data comes from your Visible Light Hub profile. What would you like to know?";
+  }
+  elseif (preg_match('/\b(web.*intelligence.*report|intelligence.*report|comprehensive.*report|full.*report|detailed.*report|complete.*analysis)\b/', $lc)) {
+    $answer = luna_generate_web_intelligence_report($facts);
+  }
+  elseif (preg_match('/\b(page.*views|pageviews|analytics|traffic|visitors|users|sessions|bounce.*rate|engagement)\b/', $lc)) {
+    $answer = luna_handle_analytics_request($prompt, $facts);
   }
   elseif (preg_match('/\bcloudflare\b/', $lc)) {
     $answer = "Cloudflare is a popular CDN (Content Delivery Network) and security service that can improve your website's performance and protect it from threats. I don't see Cloudflare specifically configured in your current setup, but it's a great option to consider for faster loading times and enhanced security.";
@@ -1844,6 +1872,32 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   }
   elseif (preg_match('/\b(thank\s?you|thanks|great|awesome|excellent|perfect)\b/', $lc)) {
     $answer = "Glad I could help! Feel free to ask if you have any other questions about your site.";
+  }
+  elseif (preg_match('/\b(help|support|issue|problem|error|bug|broken|not working|trouble|stuck|confused|need assistance)\b/', $lc)) {
+    $answer = luna_analyze_help_request($prompt, $facts);
+  }
+  elseif (preg_match('/\b(support email|send email|email support)\b/', $lc)) {
+    $answer = luna_handle_help_option('support_email', $prompt, $facts);
+  }
+  elseif (preg_match('/\b(notify vl|notify visible light|alert vl|alert visible light)\b/', $lc)) {
+    $answer = luna_handle_help_option('notify_vl', $prompt, $facts);
+  }
+  elseif (preg_match('/\b(report bug|bug report|report as bug)\b/', $lc)) {
+    $answer = luna_handle_help_option('report_bug', $prompt, $facts);
+  }
+  elseif (preg_match('/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/', $prompt)) {
+    // Email address detected - send support email
+    $email = luna_extract_email($prompt);
+    if ($email) {
+      $success = luna_send_support_email($email, $prompt, $facts);
+      if ($success) {
+        $answer = "✅ Perfect! I've sent a detailed snapshot of our conversation and your site data to " . $email . ". You should receive it shortly. Is there anything else I can help you with?";
+      } else {
+        $answer = "I encountered an issue sending the email. Let me try notifying the Visible Light team instead - would you like me to do that?";
+      }
+    } else {
+      $answer = "I couldn't find a valid email address in your message. Could you please provide the email address where you'd like me to send the support snapshot?";
+    }
   }
   elseif (preg_match("/\bhow.*many.*inactive.*themes|\binactive.*themes\b/", $lc)) {
     $inactive_themes = array();
@@ -2062,7 +2116,7 @@ add_action('rest_api_init', function () {
     },
   ));
 
-  // Posts
+  // Enhanced Posts endpoint with SEO scores, meta data, and detailed author info
   $posts_cb = function( WP_REST_Request $req ){
     if (!luna_license_ok($req)) return luna_forbidden();
     $per  = max(1, min(200, (int)$req->get_param('per_page') ?: 50));
@@ -2080,15 +2134,34 @@ add_action('rest_api_init', function () {
     foreach ($q->posts as $pid) {
       $cats = wp_get_post_terms($pid, 'category', array('fields'=>'names'));
       $tags = wp_get_post_terms($pid, 'post_tag', array('fields'=>'names'));
+      $author_id = get_post_field('post_author', $pid);
+      $author = get_user_by('id', $author_id);
+      
+      // Get meta data
+      $meta_data = get_post_meta($pid);
+      
+      // Calculate SEO score (basic implementation)
+      $seo_score = luna_calculate_seo_score($pid);
+      
       $items[] = array(
         'id'        => $pid,
         'title'     => get_the_title($pid),
         'slug'      => get_post_field('post_name', $pid),
         'date'      => get_post_time('c', true, $pid),
-        'author'    => get_the_author_meta('user_login', get_post_field('post_author', $pid)),
+        'author'    => array(
+          'id' => $author_id,
+          'username' => $author ? $author->user_login : 'Unknown',
+          'email' => $author ? $author->user_email : '',
+          'display_name' => $author ? $author->display_name : 'Unknown'
+        ),
         'categories'=> array_values($cats ?: array()),
         'tags'      => array_values($tags ?: array()),
         'permalink' => get_permalink($pid),
+        'meta_data' => $meta_data,
+        'seo_score' => $seo_score,
+        'status'    => get_post_status($pid),
+        'comment_count' => get_comments_number($pid),
+        'featured_image' => get_the_post_thumbnail_url($pid, 'full')
       );
     }
     return new WP_REST_Response(array('total'=>(int)$q->found_posts,'page'=>$page,'per_page'=>$per,'items'=>$items), 200);
@@ -2096,7 +2169,7 @@ add_action('rest_api_init', function () {
   register_rest_route('luna_widget/v1', '/content/posts', array('methods'=>'GET','permission_callback'=>$secure_cb,'callback'=>$posts_cb));
   register_rest_route('vl-hub/v1',      '/posts',         array('methods'=>'GET','permission_callback'=>$secure_cb,'callback'=>$posts_cb));
 
-  // Pages
+  // Enhanced Pages endpoint with SEO scores, meta data, and detailed author info
   $pages_cb = function( WP_REST_Request $req ){
     if (!luna_license_ok($req)) return luna_forbidden();
     $per  = max(1, min(200, (int)$req->get_param('per_page') ?: 50));
@@ -2112,14 +2185,33 @@ add_action('rest_api_init', function () {
     ));
     $items = array();
     foreach ($q->posts as $pid) {
+      $author_id = get_post_field('post_author', $pid);
+      $author = get_user_by('id', $author_id);
+      
+      // Get meta data
+      $meta_data = get_post_meta($pid);
+      
+      // Calculate SEO score (basic implementation)
+      $seo_score = luna_calculate_seo_score($pid);
+      
       $items[] = array(
         'id'        => $pid,
         'title'     => get_the_title($pid),
         'slug'      => get_post_field('post_name', $pid),
         'status'    => get_post_status($pid),
         'date'      => get_post_time('c', true, $pid),
-        'author'    => get_the_author_meta('user_login', get_post_field('post_author', $pid)),
+        'author'    => array(
+          'id' => $author_id,
+          'username' => $author ? $author->user_login : 'Unknown',
+          'email' => $author ? $author->user_email : '',
+          'display_name' => $author ? $author->display_name : 'Unknown'
+        ),
         'permalink' => get_permalink($pid),
+        'meta_data' => $meta_data,
+        'seo_score' => $seo_score,
+        'comment_count' => get_comments_number($pid),
+        'featured_image' => get_the_post_thumbnail_url($pid, 'full'),
+        'parent' => get_post_field('post_parent', $pid)
       );
     }
     return new WP_REST_Response(array('total'=>(int)$q->found_posts,'page'=>$page,'per_page'=>$per,'items'=>$items), 200);
@@ -2127,7 +2219,7 @@ add_action('rest_api_init', function () {
   register_rest_route('luna_widget/v1', '/content/pages', array('methods'=>'GET','permission_callback'=>$secure_cb,'callback'=>$pages_cb));
   register_rest_route('vl-hub/v1',      '/pages',         array('methods'=>'GET','permission_callback'=>$secure_cb,'callback'=>$pages_cb));
 
-  // Users
+  // Enhanced Users endpoint with detailed user information
   $users_cb = function( WP_REST_Request $req ){
     if (!luna_license_ok($req)) return luna_forbidden();
     $per    = max(1, min(200, (int)$req->get_param('per_page') ?: 100));
@@ -2136,17 +2228,24 @@ add_action('rest_api_init', function () {
     $u = get_users(array(
       'number' => $per,
       'offset' => $offset,
-      'fields' => array('user_login','user_email','display_name','ID'),
+      'fields' => array('user_login','user_email','display_name','ID','user_registered','user_url'),
       'orderby'=> 'ID',
       'order'  => 'ASC',
     ));
     $items = array();
     foreach ($u as $row) {
+      $user_meta = get_user_meta($row->ID);
       $items[] = array(
         'id'       => (int)$row->ID,
         'username' => $row->user_login,
         'email'    => $row->user_email,
         'name'     => $row->display_name,
+        'url'      => $row->user_url,
+        'registered' => $row->user_registered,
+        'roles'    => get_userdata($row->ID)->roles,
+        'last_login' => get_user_meta($row->ID, 'last_login', true),
+        'post_count' => count_user_posts($row->ID),
+        'meta_data' => $user_meta
       );
     }
     $counts = count_users();
@@ -2330,6 +2429,565 @@ add_action('rest_api_init', function () {
       ), 200);
     },
   ));
+
+  /* --- Comprehensive WordPress Data Collection Endpoints --- */
+  
+  // Comments endpoint
+  register_rest_route('luna_widget/v1', '/comments', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      $per_page = max(1, min(200, (int)$req->get_param('per_page') ?: 50));
+      $page = max(1, (int)$req->get_param('page') ?: 1);
+      $comments = get_comments(array(
+        'number' => $per_page,
+        'offset' => ($page - 1) * $per_page,
+        'status' => 'approve'
+      ));
+      $items = array();
+      foreach ($comments as $comment) {
+        $items[] = array(
+          'id' => $comment->comment_ID,
+          'post_id' => $comment->comment_post_ID,
+          'author' => $comment->comment_author,
+          'author_email' => $comment->comment_author_email,
+          'author_url' => $comment->comment_author_url,
+          'content' => $comment->comment_content,
+          'date' => $comment->comment_date,
+          'approved' => $comment->comment_approved,
+          'type' => $comment->comment_type,
+          'parent' => $comment->comment_parent
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Media endpoint
+  register_rest_route('luna_widget/v1', '/media', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      $per_page = max(1, min(200, (int)$req->get_param('per_page') ?: 50));
+      $page = max(1, (int)$req->get_param('page') ?: 1);
+      $query = new WP_Query(array(
+        'post_type' => 'attachment',
+        'post_status' => 'inherit',
+        'posts_per_page' => $per_page,
+        'paged' => $page,
+        'orderby' => 'date',
+        'order' => 'DESC'
+      ));
+      $items = array();
+      foreach ($query->posts as $attachment) {
+        $file_path = get_attached_file($attachment->ID);
+        $items[] = array(
+          'id' => $attachment->ID,
+          'title' => $attachment->post_title,
+          'filename' => basename($file_path),
+          'mime_type' => $attachment->post_mime_type,
+          'url' => wp_get_attachment_url($attachment->ID),
+          'date' => $attachment->post_date,
+          'author' => get_the_author_meta('user_login', $attachment->post_author),
+          'file_size' => $file_path && file_exists($file_path) ? filesize($file_path) : 0
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Categories endpoint
+  register_rest_route('luna_widget/v1', '/categories', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      $categories = get_categories(array('hide_empty' => false));
+      $items = array();
+      foreach ($categories as $category) {
+        $items[] = array(
+          'id' => $category->term_id,
+          'name' => $category->name,
+          'slug' => $category->slug,
+          'description' => $category->description,
+          'count' => $category->count,
+          'parent' => $category->parent
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Tags endpoint
+  register_rest_route('luna_widget/v1', '/tags', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      $tags = get_tags(array('hide_empty' => false));
+      $items = array();
+      foreach ($tags as $tag) {
+        $items[] = array(
+          'id' => $tag->term_id,
+          'name' => $tag->name,
+          'slug' => $tag->slug,
+          'description' => $tag->description,
+          'count' => $tag->count
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Custom post types endpoint
+  register_rest_route('luna_widget/v1', '/custom-post-types', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      $post_types = get_post_types(array('public' => true), 'objects');
+      $items = array();
+      foreach ($post_types as $post_type) {
+        if ($post_type->name === 'attachment') continue;
+        $count = wp_count_posts($post_type->name);
+        $items[] = array(
+          'name' => $post_type->name,
+          'label' => $post_type->label,
+          'description' => $post_type->description,
+          'public' => $post_type->public,
+          'hierarchical' => $post_type->hierarchical,
+          'count' => array(
+            'publish' => $count->publish,
+            'draft' => $count->draft,
+            'private' => $count->private,
+            'trash' => $count->trash
+          )
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Menus endpoint
+  register_rest_route('luna_widget/v1', '/menus', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      $menus = wp_get_nav_menus();
+      $items = array();
+      foreach ($menus as $menu) {
+        $items[] = array(
+          'id' => $menu->term_id,
+          'name' => $menu->name,
+          'slug' => $menu->slug,
+          'description' => $menu->description,
+          'count' => $menu->count
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Widgets endpoint
+  register_rest_route('luna_widget/v1', '/widgets', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      global $wp_registered_widgets;
+      $items = array();
+      foreach ($wp_registered_widgets as $widget_id => $widget) {
+        $items[] = array(
+          'id' => $widget_id,
+          'name' => $widget['name'],
+          'class' => $widget['classname'],
+          'description' => $widget['description']
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Sidebars endpoint
+  register_rest_route('luna_widget/v1', '/sidebars', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      global $wp_registered_sidebars;
+      $items = array();
+      foreach ($wp_registered_sidebars as $sidebar_id => $sidebar) {
+        $items[] = array(
+          'id' => $sidebar_id,
+          'name' => $sidebar['name'],
+          'description' => $sidebar['description'],
+          'class' => $sidebar['class'],
+          'before_widget' => $sidebar['before_widget'],
+          'after_widget' => $sidebar['after_widget'],
+          'before_title' => $sidebar['before_title'],
+          'after_title' => $sidebar['after_title']
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // Options endpoint
+  register_rest_route('luna_widget/v1', '/options', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      $options = array(
+        'site_name' => get_option('blogname'),
+        'site_description' => get_option('blogdescription'),
+        'admin_email' => get_option('admin_email'),
+        'timezone' => get_option('timezone_string'),
+        'date_format' => get_option('date_format'),
+        'time_format' => get_option('time_format'),
+        'start_of_week' => get_option('start_of_week'),
+        'language' => get_option('WPLANG'),
+        'permalink_structure' => get_option('permalink_structure'),
+        'default_category' => get_option('default_category'),
+        'default_post_format' => get_option('default_post_format'),
+        'users_can_register' => get_option('users_can_register'),
+        'default_role' => get_option('default_role'),
+        'comment_moderation' => get_option('comment_moderation'),
+        'comment_registration' => get_option('comment_registration'),
+        'close_comments_for_old_posts' => get_option('close_comments_for_old_posts'),
+        'close_comments_days_old' => get_option('close_comments_days_old'),
+        'thread_comments' => get_option('thread_comments'),
+        'thread_comments_depth' => get_option('thread_comments_depth'),
+        'page_comments' => get_option('page_comments'),
+        'comments_per_page' => get_option('comments_per_page'),
+        'default_comments_page' => get_option('default_comments_page'),
+        'comment_order' => get_option('comment_order')
+      );
+      return new WP_REST_Response(array('options'=>$options), 200);
+    },
+  ));
+
+  // Database tables endpoint
+  register_rest_route('luna_widget/v1', '/database-tables', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      global $wpdb;
+      $tables = $wpdb->get_results("SHOW TABLES", ARRAY_N);
+      $items = array();
+      foreach ($tables as $table) {
+        $table_name = $table[0];
+        $count = $wpdb->get_var("SELECT COUNT(*) FROM `$table_name`");
+        $items[] = array(
+          'name' => $table_name,
+          'count' => (int)$count
+        );
+      }
+      return new WP_REST_Response(array('items'=>$items), 200);
+    },
+  ));
+
+  // WordPress Core Status endpoint
+  register_rest_route('luna_widget/v1', '/wp-core-status', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      
+      global $wp_version;
+      $core_updates = get_site_transient('update_core');
+      $is_update_available = !empty($core_updates->updates) && $core_updates->updates[0]->response === 'upgrade';
+      
+      $status = array(
+        'version' => $wp_version,
+        'update_available' => $is_update_available,
+        'latest_version' => $is_update_available ? $core_updates->updates[0]->version : $wp_version,
+        'php_version' => PHP_VERSION,
+        'mysql_version' => $GLOBALS['wpdb']->db_version(),
+        'memory_limit' => ini_get('memory_limit'),
+        'max_execution_time' => ini_get('max_execution_time'),
+        'upload_max_filesize' => ini_get('upload_max_filesize'),
+        'post_max_size' => ini_get('post_max_size'),
+        'max_input_vars' => ini_get('max_input_vars'),
+        'is_multisite' => is_multisite(),
+        'site_url' => get_site_url(),
+        'home_url' => get_home_url(),
+        'admin_email' => get_option('admin_email'),
+        'timezone' => get_option('timezone_string'),
+        'date_format' => get_option('date_format'),
+        'time_format' => get_option('time_format'),
+        'start_of_week' => get_option('start_of_week'),
+        'language' => get_option('WPLANG'),
+        'permalink_structure' => get_option('permalink_structure'),
+        'users_can_register' => get_option('users_can_register'),
+        'default_role' => get_option('default_role'),
+        'comment_moderation' => get_option('comment_moderation'),
+        'comment_registration' => get_option('comment_registration'),
+        'close_comments_for_old_posts' => get_option('close_comments_for_old_posts'),
+        'close_comments_days_old' => get_option('close_comments_days_old'),
+        'thread_comments' => get_option('thread_comments'),
+        'thread_comments_depth' => get_option('thread_comments_depth'),
+        'page_comments' => get_option('page_comments'),
+        'comments_per_page' => get_option('comments_per_page'),
+        'default_comments_page' => get_option('default_comments_page'),
+        'comment_order' => get_option('comment_order')
+      );
+      
+      return new WP_REST_Response($status, 200);
+    },
+  ));
+
+  // Comments count endpoint
+  register_rest_route('luna_widget/v1', '/comments-count', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      
+      $counts = wp_count_comments();
+      $total = $counts->total_comments;
+      $approved = $counts->approved;
+      $pending = $counts->moderated;
+      $spam = $counts->spam;
+      $trash = $counts->trash;
+      
+      return new WP_REST_Response(array(
+        'total' => $total,
+        'approved' => $approved,
+        'pending' => $pending,
+        'spam' => $spam,
+        'trash' => $trash
+      ), 200);
+    },
+  ));
+
+  // All WordPress data endpoint (comprehensive collection)
+  register_rest_route('luna_widget/v1', '/all-wp-data', array(
+    'methods'  => 'GET',
+    'permission_callback' => $secure_cb,
+    'callback' => function( WP_REST_Request $req ){
+      if (!luna_license_ok($req)) return luna_forbidden();
+      
+      $data = array();
+      
+      // System info
+      $data['system'] = luna_snapshot_system();
+      
+      // Posts (limited to 100 most recent)
+      $posts_query = new WP_Query(array(
+        'post_type' => 'post',
+        'post_status' => 'publish',
+        'posts_per_page' => 100,
+        'orderby' => 'date',
+        'order' => 'DESC',
+        'fields' => 'ids'
+      ));
+      $data['posts'] = array();
+      foreach ($posts_query->posts as $pid) {
+        $data['posts'][] = array(
+          'id' => $pid,
+          'title' => get_the_title($pid),
+          'excerpt' => get_the_excerpt($pid),
+          'date' => get_the_date('c', $pid),
+          'author' => get_the_author_meta('user_login', get_post_field('post_author', $pid)),
+          'categories' => wp_get_post_terms($pid, 'category', array('fields'=>'names')),
+          'tags' => wp_get_post_terms($pid, 'post_tag', array('fields'=>'names'))
+        );
+      }
+      
+      // Pages (limited to 100 most recent)
+      $pages_query = new WP_Query(array(
+        'post_type' => 'page',
+        'post_status' => 'publish',
+        'posts_per_page' => 100,
+        'orderby' => 'date',
+        'order' => 'DESC',
+        'fields' => 'ids'
+      ));
+      $data['pages'] = array();
+      foreach ($pages_query->posts as $pid) {
+        $data['pages'][] = array(
+          'id' => $pid,
+          'title' => get_the_title($pid),
+          'excerpt' => get_the_excerpt($pid),
+          'date' => get_the_date('c', $pid),
+          'author' => get_the_author_meta('user_login', get_post_field('post_author', $pid)),
+          'parent' => get_post_field('post_parent', $pid)
+        );
+      }
+      
+      // Users (limited to 50 most recent)
+      $users = get_users(array('number' => 50, 'orderby' => 'registered', 'order' => 'DESC'));
+      $data['users'] = array();
+      foreach ($users as $user) {
+        $data['users'][] = array(
+          'id' => $user->ID,
+          'login' => $user->user_login,
+          'email' => $user->user_email,
+          'display_name' => $user->display_name,
+          'roles' => $user->roles,
+          'registered' => $user->user_registered,
+          'last_login' => get_user_meta($user->ID, 'last_login', true)
+        );
+      }
+      
+      // Comments (limited to 100 most recent)
+      $comments = get_comments(array('number' => 100, 'status' => 'approve'));
+      $data['comments'] = array();
+      foreach ($comments as $comment) {
+        $data['comments'][] = array(
+          'id' => $comment->comment_ID,
+          'post_id' => $comment->comment_post_ID,
+          'author' => $comment->comment_author,
+          'content' => $comment->comment_content,
+          'date' => $comment->comment_date,
+          'approved' => $comment->comment_approved
+        );
+      }
+      
+      // Media (limited to 100 most recent)
+      $media_query = new WP_Query(array(
+        'post_type' => 'attachment',
+        'post_status' => 'inherit',
+        'posts_per_page' => 100,
+        'orderby' => 'date',
+        'order' => 'DESC'
+      ));
+      $data['media'] = array();
+      foreach ($media_query->posts as $attachment) {
+        $data['media'][] = array(
+          'id' => $attachment->ID,
+          'title' => $attachment->post_title,
+          'filename' => basename(get_attached_file($attachment->ID)),
+          'mime_type' => $attachment->post_mime_type,
+          'url' => wp_get_attachment_url($attachment->ID),
+          'date' => $attachment->post_date
+        );
+      }
+      
+      // Categories
+      $categories = get_categories(array('hide_empty' => false));
+      $data['categories'] = array();
+      foreach ($categories as $category) {
+        $data['categories'][] = array(
+          'id' => $category->term_id,
+          'name' => $category->name,
+          'slug' => $category->slug,
+          'count' => $category->count
+        );
+      }
+      
+      // Tags
+      $tags = get_tags(array('hide_empty' => false));
+      $data['tags'] = array();
+      foreach ($tags as $tag) {
+        $data['tags'][] = array(
+          'id' => $tag->term_id,
+          'name' => $tag->name,
+          'slug' => $tag->slug,
+          'count' => $tag->count
+        );
+      }
+      
+      // Custom post types
+      $post_types = get_post_types(array('public' => true), 'objects');
+      $data['custom_post_types'] = array();
+      foreach ($post_types as $post_type) {
+        if ($post_type->name === 'attachment') continue;
+        $count = wp_count_posts($post_type->name);
+        $data['custom_post_types'][] = array(
+          'name' => $post_type->name,
+          'label' => $post_type->label,
+          'count' => array(
+            'publish' => $count->publish,
+            'draft' => $count->draft,
+            'private' => $count->private
+          )
+        );
+      }
+      
+      // Menus
+      $menus = wp_get_nav_menus();
+      $data['menus'] = array();
+      foreach ($menus as $menu) {
+        $data['menus'][] = array(
+          'id' => $menu->term_id,
+          'name' => $menu->name,
+          'count' => $menu->count
+        );
+      }
+      
+      // Site options
+      $data['options'] = array(
+        'site_name' => get_option('blogname'),
+        'site_description' => get_option('blogdescription'),
+        'admin_email' => get_option('admin_email'),
+        'timezone' => get_option('timezone_string'),
+        'language' => get_option('WPLANG'),
+        'permalink_structure' => get_option('permalink_structure'),
+        'users_can_register' => get_option('users_can_register'),
+        'default_role' => get_option('default_role')
+      );
+      
+      return new WP_REST_Response($data, 200);
+    },
+  ));
+
+  /* --- Sync to Hub endpoint --- */
+  register_rest_route('luna_widget/v1', '/sync-to-hub', array(
+    'methods'  => 'POST',
+    'permission_callback' => function(){ return current_user_can('manage_options'); },
+    'callback' => function(){
+      $license = luna_get_license();
+      if (!$license) {
+        return new WP_REST_Response(array('ok'=>false,'error'=>'No license found'), 400);
+      }
+      
+      // Sync all data to Hub
+      $settings_data = array(
+        'license' => $license,
+        'hub_url' => luna_widget_hub_base(),
+        'mode' => get_option(LUNA_WIDGET_OPT_MODE, 'widget'),
+        'ui_settings' => get_option(LUNA_WIDGET_OPT_SETTINGS, array()),
+        'wp_version' => get_bloginfo('version'),
+        'plugin_version' => LUNA_WIDGET_PLUGIN_VERSION,
+        'site_url' => home_url('/'),
+        'last_sync' => current_time('mysql')
+      );
+      
+      luna_sync_settings_to_hub($settings_data);
+      
+      // Sync keywords
+      $keywords = luna_get_keyword_mappings();
+      luna_sync_keywords_to_hub($keywords);
+      
+      // Sync analytics settings
+      $analytics = get_option('luna_ga4_settings', array());
+      if (!empty($analytics)) {
+        luna_sync_analytics_to_hub($analytics);
+      }
+      
+      return new WP_REST_Response(array('ok'=>true,'message'=>'All data synced to Hub'), 200);
+    },
+  ));
+});
+
+// AJAX handler for Luna Widget chat transcript
+add_action('wp_ajax_luna_get_chat_transcript', function() {
+  check_ajax_referer('luna_chat_transcript_nonce', 'nonce');
+  
+  $license_key = sanitize_text_field($_POST['license_key'] ?? '');
+  if (empty($license_key)) {
+    wp_send_json_error('License key required');
+    return;
+  }
+  
+  $transcript = luna_get_chat_transcript($license_key);
+  wp_send_json_success(array('transcript' => $transcript));
 });
 
 /* ============================================================
@@ -2571,6 +3229,190 @@ function luna_sync_keywords_to_hub($mappings) {
   if (is_wp_error($response)) {
     error_log('[Luna] Failed to sync keywords to Hub: ' . $response->get_error_message());
   }
+}
+
+// Sync analytics data to Hub
+function luna_sync_analytics_to_hub($analytics_data) {
+  $license = luna_get_license();
+  if (!$license) return;
+  
+  $response = wp_remote_post('https://visiblelight.ai/wp-json/vl-hub/v1/sync-client-data', [
+    'timeout' => 10,
+    'headers' => ['X-Luna-License' => $license, 'Content-Type' => 'application/json'],
+    'body' => json_encode([
+      'license' => $license,
+      'category' => 'analytics',
+      'analytics_data' => $analytics_data
+    ])
+  ]);
+  
+  if (is_wp_error($response)) {
+    error_log('[Luna] Failed to sync analytics to Hub: ' . $response->get_error_message());
+  }
+}
+
+// Sync security data to Hub
+function luna_sync_security_to_hub($security_data) {
+  $license = luna_get_license();
+  if (!$license) return;
+  
+  $response = wp_remote_post('https://visiblelight.ai/wp-json/vl-hub/v1/sync-client-data', [
+    'timeout' => 10,
+    'headers' => ['X-Luna-License' => $license, 'Content-Type' => 'application/json'],
+    'body' => json_encode([
+      'license' => $license,
+      'category' => 'security',
+      'security_data' => $security_data
+    ])
+  ]);
+  
+  if (is_wp_error($response)) {
+    error_log('[Luna] Failed to sync security to Hub: ' . $response->get_error_message());
+  }
+}
+
+// Sync settings data to Hub
+function luna_sync_settings_to_hub($settings_data) {
+  $license = luna_get_license();
+  if (!$license) return;
+  
+  $response = wp_remote_post('https://visiblelight.ai/wp-json/vl-hub/v1/sync-client-data', [
+    'timeout' => 10,
+    'headers' => ['X-Luna-License' => $license, 'Content-Type' => 'application/json'],
+    'body' => json_encode([
+      'license' => $license,
+      'category' => 'infrastructure',
+      'settings_data' => $settings_data
+    ])
+  ]);
+  
+  if (is_wp_error($response)) {
+    error_log('[Luna] Failed to sync settings to Hub: ' . $response->get_error_message());
+  }
+}
+
+// Get data from Hub for Luna Chat Widget
+function luna_get_hub_data($category = null) {
+  $license = luna_get_license();
+  if (!$license) return null;
+  
+  // Get profile data from VL Hub which includes GA4 analytics
+  $url = 'https://visiblelight.ai/wp-json/vl-hub/v1/profile';
+  $args = ['license' => $license];
+  if ($category) {
+    $args['category'] = $category;
+  }
+  
+  $response = wp_remote_get(add_query_arg($args, $url), [
+    'timeout' => 10,
+    'headers' => ['X-Luna-License' => $license]
+  ]);
+  
+  if (is_wp_error($response)) {
+    error_log('[Luna] Failed to get data from Hub: ' . $response->get_error_message());
+    return null;
+  }
+  
+  $body = wp_remote_retrieve_body($response);
+  $data = json_decode($body, true);
+  
+  // Extract GA4 metrics if available
+  if (isset($data['ga4_metrics'])) {
+    $data['analytics'] = $data['ga4_metrics'];
+  }
+  
+  return $data;
+}
+
+// Get interactions count for Luna Widget
+function luna_get_interactions_count() {
+  $license = luna_get_license();
+  if (!$license) return 0;
+  
+  // Get interactions count from stored data
+  $interactions_data = get_option('luna_interactions_' . $license, array());
+  return isset($interactions_data['total_interactions']) ? (int)$interactions_data['total_interactions'] : 0;
+}
+
+// Get chat transcript for Luna Widget
+function luna_get_chat_transcript($license_key) {
+  if (empty($license_key)) return array();
+  
+  // Get chat transcript from stored data
+  $transcript_data = get_option('luna_chat_transcript_' . $license_key, array());
+  return $transcript_data;
+}
+
+// Calculate SEO score for posts and pages
+function luna_calculate_seo_score($post_id) {
+  $score = 0;
+  $max_score = 100;
+  
+  // Title (20 points)
+  $title = get_the_title($post_id);
+  if (!empty($title)) {
+    $score += 20;
+    if (strlen($title) >= 30 && strlen($title) <= 60) {
+      $score += 5; // Bonus for optimal length
+    }
+  }
+  
+  // Content (20 points)
+  $content = get_post_field('post_content', $post_id);
+  if (!empty($content)) {
+    $score += 20;
+    if (str_word_count($content) >= 300) {
+      $score += 10; // Bonus for substantial content
+    }
+  }
+  
+  // Excerpt (10 points)
+  $excerpt = get_the_excerpt($post_id);
+  if (!empty($excerpt)) {
+    $score += 10;
+  }
+  
+  // Featured image (10 points)
+  if (has_post_thumbnail($post_id)) {
+    $score += 10;
+  }
+  
+  // Categories/Tags (10 points)
+  $categories = wp_get_post_terms($post_id, 'category');
+  $tags = wp_get_post_terms($post_id, 'post_tag');
+  if (!empty($categories) || !empty($tags)) {
+    $score += 10;
+  }
+  
+  // Meta description (10 points)
+  $meta_description = get_post_meta($post_id, '_yoast_wpseo_metadesc', true);
+  if (empty($meta_description)) {
+    $meta_description = get_post_meta($post_id, '_aioseo_description', true);
+  }
+  if (!empty($meta_description)) {
+    $score += 10;
+  }
+  
+  // Focus keyword (10 points)
+  $focus_keyword = get_post_meta($post_id, '_yoast_wpseo_focuskw', true);
+  if (empty($focus_keyword)) {
+    $focus_keyword = get_post_meta($post_id, '_aioseo_keywords', true);
+  }
+  if (!empty($focus_keyword)) {
+    $score += 10;
+  }
+  
+  // Internal links (5 points)
+  if (strpos($content, '<a href="' . home_url()) !== false) {
+    $score += 5;
+  }
+  
+  // External links (5 points)
+  if (preg_match('/<a href="(?!' . preg_quote(home_url(), '/') . ')/', $content)) {
+    $score += 5;
+  }
+  
+  return min($score, $max_score);
 }
 
 // Track keyword usage and performance
@@ -3642,10 +4484,91 @@ function luna_widget_keywords_admin_page() {
       alert('Export functionality coming soon!');
     }
     
-    function luna_import_keywords() {
-      // TODO: Implement keyword import functionality
-      alert('Import functionality coming soon!');
+  function luna_import_keywords() {
+    // TODO: Implement keyword import functionality
+    alert('Import functionality coming soon!');
+  }
+  
+  // Chat transcript functionality
+  function showLunaChatTranscript(licenseKey) {
+    // Create modal if it doesn't exist
+    if (!document.getElementById('luna-chat-transcript-modal')) {
+      var modal = document.createElement('div');
+      modal.id = 'luna-chat-transcript-modal';
+      modal.className = 'luna-modal';
+      modal.innerHTML = `
+        <div class="luna-modal-content">
+          <div class="luna-modal-header">
+            <h3>Luna Chat Transcript - License: ${licenseKey}</h3>
+            <span class="luna-modal-close" onclick="closeLunaChatTranscript()">&times;</span>
+          </div>
+          <div class="luna-modal-body" id="luna-chat-transcript-content">
+            <p>Loading chat transcript...</p>
+          </div>
+          <div class="luna-modal-footer" style="margin-top: 20px; text-align: right;">
+            <button type="button" class="button" onclick="closeLunaChatTranscript()">Close</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
     }
+    
+    // Show modal
+    document.getElementById('luna-chat-transcript-modal').style.display = 'block';
+    
+    // Load transcript data
+    loadLunaChatTranscript(licenseKey);
+  }
+  
+  function closeLunaChatTranscript() {
+    document.getElementById('luna-chat-transcript-modal').style.display = 'none';
+  }
+  
+  function loadLunaChatTranscript(licenseKey) {
+    // Make AJAX request to get chat transcript
+    jQuery.ajax({
+      url: '<?php echo admin_url('admin-ajax.php'); ?>',
+      type: 'POST',
+      data: {
+        action: 'luna_get_chat_transcript',
+        license_key: licenseKey,
+        nonce: '<?php echo wp_create_nonce('luna_chat_transcript_nonce'); ?>'
+      },
+      success: function(response) {
+        if (response.success) {
+          var content = document.getElementById('luna-chat-transcript-content');
+          if (response.data.transcript && response.data.transcript.length > 0) {
+            var html = '<div class="luna-chat-transcript">';
+            response.data.transcript.forEach(function(entry) {
+              html += '<div class="luna-chat-entry ' + entry.type + '">';
+              html += '<div style="font-weight: bold; color: #333; margin-bottom: 5px;">';
+              html += (entry.type === 'user' ? '👤 User' : '🤖 Luna') + ' - ' + entry.timestamp;
+              html += '</div>';
+              html += '<div style="color: #555;">' + entry.message + '</div>';
+              html += '</div>';
+            });
+            html += '</div>';
+            content.innerHTML = html;
+          } else {
+            content.innerHTML = '<p>No chat transcript available for this license.</p>';
+          }
+        } else {
+          document.getElementById('luna-chat-transcript-content').innerHTML = '<p>Error loading chat transcript: ' + response.data + '</p>';
+        }
+      },
+      error: function() {
+        document.getElementById('luna-chat-transcript-content').innerHTML = '<p>Error loading chat transcript. Please try again.</p>';
+      }
+    });
+  }
+  
+  // Close modal when clicking outside
+  window.onclick = function(event) {
+    var modal = document.getElementById('luna-chat-transcript-modal');
+    if (event.target === modal) {
+      closeLunaChatTranscript();
+    }
+  }
   </script>
   <?php
 }
@@ -3657,6 +4580,26 @@ function luna_widget_analytics_admin_page() {
   <div class="wrap">
     <h1>Luna Chat Analytics</h1>
     <p>Track keyword performance and usage statistics to optimize your Luna Chat experience.</p>
+    
+    <div class="notice notice-info">
+      <p><strong>Note:</strong> GA4 Analytics integration has been moved to the <a href="https://visiblelight.ai/wp-admin/admin.php?page=vl-hub-profile" target="_blank">VL Client Hub Profile</a> for centralized management.</p>
+    </div>
+    
+    <!-- Interactions Metric -->
+    <div class="postbox" style="margin-top: 20px;">
+      <h2 class="hndle">Chat Interactions</h2>
+      <div class="inside">
+        <?php
+        $interactions_count = luna_get_interactions_count();
+        $license = luna_get_license();
+        ?>
+        <div class="luna-interactions-metric" style="text-align: center; padding: 20px; background: #f9f9f9; border-radius: 5px; cursor: pointer;" onclick="showLunaChatTranscript('<?php echo esc_js($license); ?>')">
+          <div style="font-size: 3em; font-weight: bold; color: #0073aa; margin-bottom: 10px;"><?php echo $interactions_count; ?></div>
+          <div style="font-size: 1.2em; color: #666;">Total Interactions</div>
+          <div style="font-size: 0.9em; color: #999; margin-top: 5px;">Click to view chat transcript</div>
+        </div>
+      </div>
+    </div>
     
     <?php if (empty($performance)): ?>
       <div class="notice notice-info">
@@ -3848,6 +4791,67 @@ function luna_widget_analytics_admin_page() {
     }
     .luna-insight ul {
       margin: 10px 0;
+    }
+    
+    /* Chat Transcript Modal Styles */
+    .luna-modal {
+      position: fixed;
+      z-index: 100000;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0,0,0,0.5);
+      display: none;
+    }
+    
+    .luna-modal-content {
+      background-color: #fff;
+      margin: 5% auto;
+      padding: 20px;
+      border-radius: 8px;
+      width: 80%;
+      max-width: 800px;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    
+    .luna-modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #ddd;
+    }
+    
+    .luna-modal-close {
+      font-size: 24px;
+      font-weight: bold;
+      cursor: pointer;
+      color: #666;
+    }
+    
+    .luna-chat-transcript {
+      max-height: 400px;
+      overflow-y: auto;
+      border: 1px solid #ddd;
+      padding: 15px;
+      background: #f9f9f9;
+    }
+    
+    .luna-chat-entry {
+      margin-bottom: 15px;
+      padding: 10px;
+      border-radius: 5px;
+    }
+    
+    .luna-chat-entry.user {
+      background: #e3f2fd;
+    }
+    
+    .luna-chat-entry.assistant {
+      background: #f5f5f5;
     }
     
     /* Keyword Interface Styles */
@@ -4296,4 +5300,499 @@ function luna_license_ok( WP_REST_Request $req ) {
 }
 function luna_forbidden() {
   return new WP_REST_Response(array('ok'=>false,'error'=>'forbidden'), 403);
+}
+
+/**
+ * Analyzes help requests and offers contextual assistance options
+ */
+function luna_analyze_help_request($prompt, $facts) {
+  $help_type = luna_detect_help_type($prompt);
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  
+  $response = "I understand you're experiencing an issue. Let me help you get this resolved quickly! ";
+  
+  switch ($help_type) {
+    case 'technical':
+      $response .= "This sounds like a technical issue. I can help you in a few ways:\n\n";
+      $response .= "🔧 **Option 1: Send Support Email**\n";
+      $response .= "I can send a detailed snapshot of our conversation and your site data to your email for technical review.\n\n";
+      $response .= "📧 **Option 2: Notify Visible Light Team**\n";
+      $response .= "I can alert the Visible Light support team about this issue.\n\n";
+      $response .= "🐛 **Option 3: Report as Bug**\n";
+      $response .= "If this seems like a bug, I can report it directly to the development team.\n\n";
+      $response .= "Which option would you prefer? Just say 'support email', 'notify VL', or 'report bug'.";
+      break;
+      
+    case 'content':
+      $response .= "This seems like a content or website management issue. I can help you by:\n\n";
+      $response .= "📝 **Option 1: Content Support**\n";
+      $response .= "Send your content team a detailed report of what you're trying to accomplish.\n\n";
+      $response .= "📧 **Option 2: Notify Visible Light**\n";
+      $response .= "Alert the Visible Light team about this content issue.\n\n";
+      $response .= "Which would you prefer? Say 'support email' or 'notify VL'.";
+      break;
+      
+    case 'urgent':
+      $response .= "This sounds urgent! I can help you immediately by:\n\n";
+      $response .= "🚨 **Option 1: Emergency Support**\n";
+      $response .= "Send an urgent support request with full context to your team.\n\n";
+      $response .= "📞 **Option 2: Notify Visible Light**\n";
+      $response .= "Alert the Visible Light team immediately about this urgent issue.\n\n";
+      $response .= "🐛 **Option 3: Report Critical Bug**\n";
+      $response .= "If this is a critical bug, report it directly to development.\n\n";
+      $response .= "Which option would you like? Say 'support email', 'notify VL', or 'report bug'.";
+      break;
+      
+    default:
+      $response .= "I can help you get this resolved. Here are your options:\n\n";
+      $response .= "📧 **Option 1: Send Support Email**\n";
+      $response .= "I'll send a detailed snapshot of our conversation to your email.\n\n";
+      $response .= "📞 **Option 2: Notify Visible Light**\n";
+      $response .= "I'll alert the Visible Light team about this issue.\n\n";
+      $response .= "🐛 **Option 3: Report Bug**\n";
+      $response .= "If this seems like a bug, I'll report it to the development team.\n\n";
+      $response .= "Which option would you prefer? Just say 'support email', 'notify VL', or 'report bug'.";
+  }
+  
+  return $response;
+}
+
+/**
+ * Detects the type of help request based on keywords and context
+ */
+function luna_detect_help_type($prompt) {
+  $lc = strtolower($prompt);
+  
+  // Urgent keywords
+  if (preg_match('/\b(urgent|critical|emergency|down|crash|fatal|broken|not working|error|bug)\b/', $lc)) {
+    return 'urgent';
+  }
+  
+  // Technical keywords
+  if (preg_match('/\b(technical|server|database|plugin|theme|code|php|mysql|error|bug|fix|repair)\b/', $lc)) {
+    return 'technical';
+  }
+  
+  // Content keywords
+  if (preg_match('/\b(content|page|post|edit|update|publish|media|image|text|format)\b/', $lc)) {
+    return 'content';
+  }
+  
+  return 'general';
+}
+
+/**
+ * Handles help option responses
+ */
+function luna_handle_help_option($option, $prompt, $facts) {
+  switch ($option) {
+    case 'support_email':
+      return luna_handle_support_email_request($prompt, $facts);
+    case 'notify_vl':
+      return luna_handle_notify_vl_request($prompt, $facts);
+    case 'report_bug':
+      return luna_handle_bug_report_request($prompt, $facts);
+    default:
+      return "I'm not sure which option you meant. Please say 'support email', 'notify VL', or 'report bug'.";
+  }
+}
+
+/**
+ * Handles support email requests
+ */
+function luna_handle_support_email_request($prompt, $facts) {
+  return "Great! I'd be happy to send you a detailed snapshot of our conversation and your site data. Which email address would you like me to send this to?";
+}
+
+/**
+ * Handles Visible Light notification requests
+ */
+function luna_handle_notify_vl_request($prompt, $facts) {
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  
+  // Send notification to Visible Light
+  $success = luna_send_vl_notification($prompt, $facts);
+  
+  if ($success) {
+    return "✅ I've notified the Visible Light team about your issue. They'll review the details and get back to you soon. Is there anything else I can help you with?";
+  } else {
+    return "I encountered an issue sending the notification. Let me try the support email option instead - which email address would you like me to send the snapshot to?";
+  }
+}
+
+/**
+ * Handles bug report requests
+ */
+function luna_handle_bug_report_request($prompt, $facts) {
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  
+  // Send bug report to Visible Light
+  $success = luna_send_bug_report($prompt, $facts);
+  
+  if ($success) {
+    return "🐛 I've reported this as a bug to the Visible Light development team. They'll investigate and work on a fix. You should hear back soon. Is there anything else I can help you with?";
+  } else {
+    return "I encountered an issue sending the bug report. Let me try the support email option instead - which email address would you like me to send the snapshot to?";
+  }
+}
+
+/**
+ * Sends notification to Visible Light team
+ */
+function luna_send_vl_notification($prompt, $facts) {
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  $license = luna_get_license();
+  
+  $subject = "Luna Chat Support Request - " . $site_name;
+  $message = "
+  <html>
+  <body style='font-family: Arial, sans-serif; line-height: 1.6; color: #333;'>
+    <div style='max-width: 600px; margin: 0 auto; padding: 20px;'>
+      <h2 style='color: #2B6AFF;'>Luna Chat Support Request</h2>
+      <p><strong>Site:</strong> " . esc_html($site_name) . "</p>
+      <p><strong>URL:</strong> " . esc_html($site_url) . "</p>
+      <p><strong>License:</strong> " . esc_html($license) . "</p>
+      <p><strong>Issue:</strong> " . esc_html($prompt) . "</p>
+      
+      <h3>Site Information:</h3>
+      <ul>
+        <li>WordPress Version: " . esc_html($facts['wp_version'] ?? 'Unknown') . "</li>
+        <li>PHP Version: " . esc_html($facts['php_version'] ?? 'Unknown') . "</li>
+        <li>Theme: " . esc_html($facts['theme'] ?? 'Unknown') . "</li>
+        <li>Health Score: " . esc_html($facts['health_score'] ?? 'Unknown') . "%</li>
+      </ul>
+      
+      <p>This request was generated automatically by Luna Chat AI.</p>
+    </div>
+  </body>
+  </html>
+  ";
+  
+  $headers = array('Content-Type: text/html; charset=UTF-8');
+  return wp_mail('support@visiblelight.ai', $subject, $message, $headers);
+}
+
+/**
+ * Sends bug report to Visible Light team
+ */
+function luna_send_bug_report($prompt, $facts) {
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  $license = luna_get_license();
+  
+  $subject = "🐛 Bug Report - " . $site_name . " - Luna Chat";
+  $message = "
+  <html>
+  <body style='font-family: Arial, sans-serif; line-height: 1.6; color: #333;'>
+    <div style='max-width: 600px; margin: 0 auto; padding: 20px;'>
+      <h2 style='color: #d63638;'>🐛 Bug Report</h2>
+      <p><strong>Site:</strong> " . esc_html($site_name) . "</p>
+      <p><strong>URL:</strong> " . esc_html($site_url) . "</p>
+      <p><strong>License:</strong> " . esc_html($license) . "</p>
+      <p><strong>Bug Description:</strong> " . esc_html($prompt) . "</p>
+      
+      <h3>System Information:</h3>
+      <ul>
+        <li>WordPress Version: " . esc_html($facts['wp_version'] ?? 'Unknown') . "</li>
+        <li>PHP Version: " . esc_html($facts['php_version'] ?? 'Unknown') . "</li>
+        <li>Theme: " . esc_html($facts['theme'] ?? 'Unknown') . "</li>
+        <li>Health Score: " . esc_html($facts['health_score'] ?? 'Unknown') . "%</li>
+        <li>SSL Status: " . (isset($facts['tls_valid']) && $facts['tls_valid'] ? 'Active' : 'Issues') . "</li>
+      </ul>
+      
+      <p>This bug report was generated automatically by Luna Chat AI.</p>
+    </div>
+  </body>
+  </html>
+  ";
+  
+  $headers = array('Content-Type: text/html; charset=UTF-8');
+  return wp_mail('bugs@visiblelight.ai', $subject, $message, $headers);
+}
+
+/**
+ * Extracts email address from text
+ */
+function luna_extract_email($text) {
+  if (preg_match('/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/', $text, $matches)) {
+    return $matches[0];
+  }
+  return false;
+}
+
+/**
+ * Sends support email with chat snapshot
+ */
+function luna_send_support_email($email, $prompt, $facts) {
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  $license = luna_get_license();
+  
+  $subject = "Luna Chat Support Snapshot - " . $site_name;
+  $message = "
+  <html>
+  <body style='font-family: Arial, sans-serif; line-height: 1.6; color: #333;'>
+    <div style='max-width: 600px; margin: 0 auto; padding: 20px;'>
+      <h2 style='color: #2B6AFF;'>Luna Chat Support Snapshot</h2>
+      <p>This email contains a detailed snapshot of your Luna Chat conversation and site data.</p>
+      
+      <h3>Site Information:</h3>
+      <ul>
+        <li><strong>Site:</strong> " . esc_html($site_name) . "</li>
+        <li><strong>URL:</strong> " . esc_html($site_url) . "</li>
+        <li><strong>License:</strong> " . esc_html($license) . "</li>
+        <li><strong>WordPress Version:</strong> " . esc_html($facts['wp_version'] ?? 'Unknown') . "</li>
+        <li><strong>PHP Version:</strong> " . esc_html($facts['php_version'] ?? 'Unknown') . "</li>
+        <li><strong>Theme:</strong> " . esc_html($facts['theme'] ?? 'Unknown') . "</li>
+        <li><strong>Health Score:</strong> " . esc_html($facts['health_score'] ?? 'Unknown') . "%</li>
+        <li><strong>SSL Status:</strong> " . (isset($facts['tls_valid']) && $facts['tls_valid'] ? 'Active' : 'Issues') . "</li>
+      </ul>
+      
+      <h3>Issue Description:</h3>
+      <p>" . esc_html($prompt) . "</p>
+      
+      <h3>System Health Details:</h3>
+      <ul>
+        <li>Memory Usage: " . esc_html($facts['memory_usage'] ?? 'Unknown') . "</li>
+        <li>Active Plugins: " . (isset($facts['active_plugins']) ? count($facts['active_plugins']) : 'Unknown') . "</li>
+        <li>Pages: " . esc_html($facts['pages_count'] ?? 'Unknown') . "</li>
+        <li>Posts: " . esc_html($facts['posts_count'] ?? 'Unknown') . "</li>
+      </ul>
+      
+      <h3>Analytics Data:</h3>";
+  
+  if (isset($facts['ga4_metrics'])) {
+    $ga4 = $facts['ga4_metrics'];
+    $message .= "<ul>";
+    $message .= "<li>Total Users: " . esc_html($ga4['totalUsers'] ?? 'N/A') . "</li>";
+    $message .= "<li>New Users: " . esc_html($ga4['newUsers'] ?? 'N/A') . "</li>";
+    $message .= "<li>Sessions: " . esc_html($ga4['sessions'] ?? 'N/A') . "</li>";
+    $message .= "<li>Page Views: " . esc_html($ga4['screenPageViews'] ?? 'N/A') . "</li>";
+    $message .= "<li>Bounce Rate: " . esc_html($ga4['bounceRate'] ?? 'N/A') . "%</li>";
+    $message .= "<li>Engagement Rate: " . esc_html($ga4['engagementRate'] ?? 'N/A') . "%</li>";
+    $message .= "</ul>";
+  } else {
+    $message .= "<p>No analytics data available</p>";
+  }
+  
+  $message .= "
+      <hr style='margin: 30px 0; border: none; border-top: 1px solid #eee;'>
+      <p style='font-size: 12px; color: #666;'>This support snapshot was generated automatically by Luna Chat AI on " . date('Y-m-d H:i:s T') . "</p>
+    </div>
+  </body>
+  </html>
+  ";
+  
+  $headers = array('Content-Type: text/html; charset=UTF-8');
+  return wp_mail($email, $subject, $message, $headers);
+}
+
+/**
+ * Handles analytics requests and provides GA4 data
+ */
+function luna_handle_analytics_request($prompt, $facts) {
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  
+  // Get GA4 data from facts array (same as intelligence report)
+  $ga4_metrics = null;
+  
+  if (isset($facts['ga4_metrics'])) {
+    $ga4_metrics = $facts['ga4_metrics'];
+  }
+  
+  // Debug logging
+  error_log('[Luna Analytics] Facts keys: ' . implode(', ', array_keys($facts)));
+  error_log('[Luna Analytics] GA4 metrics found: ' . ($ga4_metrics ? 'YES' : 'NO'));
+  if ($ga4_metrics) {
+    error_log('[Luna Analytics] GA4 data: ' . print_r($ga4_metrics, true));
+  }
+  
+  if (!$ga4_metrics) {
+    return "I don't have access to your analytics data right now. Your GA4 integration may need to be refreshed. You can check your analytics settings in the Visible Light Hub profile, or I can help you set up Google Analytics if it's not configured yet.";
+  }
+  
+  $lc = strtolower($prompt);
+  
+  // Handle specific analytics questions
+  if (preg_match('/\b(page.*views|pageviews)\b/', $lc)) {
+    $page_views = isset($ga4_metrics['screenPageViews']) ? $ga4_metrics['screenPageViews'] : 'N/A';
+    return "Your page views for the current period are: **" . $page_views . "** views. This data comes from your Google Analytics 4 integration.";
+  }
+  
+  if (preg_match('/\b(users|visitors)\b/', $lc)) {
+    $total_users = isset($ga4_metrics['totalUsers']) ? $ga4_metrics['totalUsers'] : 'N/A';
+    $new_users = isset($ga4_metrics['newUsers']) ? $ga4_metrics['newUsers'] : 'N/A';
+    return "Your user analytics show:\n• **Total Users**: " . $total_users . "\n• **New Users**: " . $new_users . "\nThis data comes from your Google Analytics 4 integration.";
+  }
+  
+  if (preg_match('/\b(sessions)\b/', $lc)) {
+    $sessions = isset($ga4_metrics['sessions']) ? $ga4_metrics['sessions'] : 'N/A';
+    return "Your sessions for the current period are: **" . $sessions . "** sessions. This data comes from your Google Analytics 4 integration.";
+  }
+  
+  if (preg_match('/\b(bounce.*rate)\b/', $lc)) {
+    $bounce_rate = isset($ga4_metrics['bounceRate']) ? $ga4_metrics['bounceRate'] : 'N/A';
+    return "Your bounce rate is: **" . $bounce_rate . "%**. This data comes from your Google Analytics 4 integration.";
+  }
+  
+  if (preg_match('/\b(engagement.*rate|engagement)\b/', $lc)) {
+    $engagement_rate = isset($ga4_metrics['engagementRate']) ? $ga4_metrics['engagementRate'] : 'N/A';
+    return "Your engagement rate is: **" . $engagement_rate . "%**. This data comes from your Google Analytics 4 integration.";
+  }
+  
+  // General analytics summary
+  $summary = "Here's your current analytics data from Google Analytics 4:\n\n";
+  $summary .= "📊 **Traffic Overview:**\n";
+  $summary .= "• **Total Users**: " . (isset($ga4_metrics['totalUsers']) ? $ga4_metrics['totalUsers'] : 'N/A') . "\n";
+  $summary .= "• **New Users**: " . (isset($ga4_metrics['newUsers']) ? $ga4_metrics['newUsers'] : 'N/A') . "\n";
+  $summary .= "• **Sessions**: " . (isset($ga4_metrics['sessions']) ? $ga4_metrics['sessions'] : 'N/A') . "\n";
+  $summary .= "• **Page Views**: " . (isset($ga4_metrics['screenPageViews']) ? $ga4_metrics['screenPageViews'] : 'N/A') . "\n\n";
+  $summary .= "📈 **Engagement Metrics:**\n";
+  $summary .= "• **Bounce Rate**: " . (isset($ga4_metrics['bounceRate']) ? $ga4_metrics['bounceRate'] . '%' : 'N/A') . "\n";
+  $summary .= "• **Engagement Rate**: " . (isset($ga4_metrics['engagementRate']) ? $ga4_metrics['engagementRate'] . '%' : 'N/A') . "\n";
+  $summary .= "• **Avg Session Duration**: " . (isset($ga4_metrics['averageSessionDuration']) ? $ga4_metrics['averageSessionDuration'] : 'N/A') . "\n\n";
+  
+  if (isset($ga4_metrics['totalRevenue']) && $ga4_metrics['totalRevenue'] > 0) {
+    $summary .= "💰 **Revenue**: $" . $ga4_metrics['totalRevenue'] . "\n\n";
+  }
+  
+  $summary .= "This data is pulled from your Google Analytics 4 integration and updated regularly.";
+  
+  return $summary;
+}
+
+/**
+ * Generates a comprehensive web intelligence report using Visible Light Hub data
+ */
+function luna_generate_web_intelligence_report($facts) {
+  $report = array();
+  
+  // Site Overview
+  $site_url = isset($facts['site_url']) ? $facts['site_url'] : home_url('/');
+  $site_name = parse_url($site_url, PHP_URL_HOST);
+  
+  $report[] = "🌐 **WEB INTELLIGENCE REPORT** for " . $site_name;
+  $report[] = "Generated: " . date('Y-m-d H:i:s T');
+  $report[] = "";
+  
+  // System Health & Performance
+  $report[] = "📊 **SYSTEM HEALTH & PERFORMANCE**";
+  $health_score = isset($facts['health_score']) ? $facts['health_score'] : 'N/A';
+  $wp_version = isset($facts['wp_version']) ? $facts['wp_version'] : 'Unknown';
+  $php_version = isset($facts['php_version']) ? $facts['php_version'] : 'Unknown';
+  $memory_usage = isset($facts['memory_usage']) ? $facts['memory_usage'] : 'Unknown';
+  
+  $report[] = "• Overall Health Score: " . $health_score . "%";
+  $report[] = "• WordPress Version: " . $wp_version;
+  $report[] = "• PHP Version: " . $php_version;
+  $report[] = "• Memory Usage: " . $memory_usage;
+  $report[] = "";
+  
+  // Security Analysis
+  $report[] = "🔒 **SECURITY ANALYSIS**";
+  $tls_valid = isset($facts['tls_valid']) ? $facts['tls_valid'] : false;
+  $tls_issuer = isset($facts['tls_issuer']) ? $facts['tls_issuer'] : 'Unknown';
+  $tls_expires = isset($facts['tls_expires']) ? $facts['tls_expires'] : 'Unknown';
+  $mfa_status = isset($facts['mfa']) ? $facts['mfa'] : 'Not configured';
+  
+  $report[] = "• SSL/TLS Status: " . ($tls_valid ? "✅ Active" : "❌ Issues detected");
+  $report[] = "• Certificate Issuer: " . $tls_issuer;
+  $report[] = "• Certificate Expires: " . $tls_expires;
+  $report[] = "• Multi-Factor Auth: " . $mfa_status;
+  $report[] = "";
+  
+  // Analytics & Traffic Intelligence
+  $report[] = "📈 **ANALYTICS & TRAFFIC INTELLIGENCE**";
+  
+  // Check if GA4 data is available
+  if (isset($facts['ga4_metrics'])) {
+    $ga4 = $facts['ga4_metrics'];
+    $report[] = "• Total Users: " . (isset($ga4['totalUsers']) ? $ga4['totalUsers'] : 'N/A');
+    $report[] = "• New Users: " . (isset($ga4['newUsers']) ? $ga4['newUsers'] : 'N/A');
+    $report[] = "• Sessions: " . (isset($ga4['sessions']) ? $ga4['sessions'] : 'N/A');
+    $report[] = "• Page Views: " . (isset($ga4['screenPageViews']) ? $ga4['screenPageViews'] : 'N/A');
+    $report[] = "• Bounce Rate: " . (isset($ga4['bounceRate']) ? $ga4['bounceRate'] . '%' : 'N/A');
+    $report[] = "• Engagement Rate: " . (isset($ga4['engagementRate']) ? $ga4['engagementRate'] . '%' : 'N/A');
+    $report[] = "• Avg Session Duration: " . (isset($ga4['averageSessionDuration']) ? $ga4['averageSessionDuration'] : 'N/A');
+    $report[] = "• Total Revenue: " . (isset($ga4['totalRevenue']) ? '$' . $ga4['totalRevenue'] : 'N/A');
+  } else {
+    $report[] = "• Analytics: GA4 integration not configured or no recent data";
+  }
+  $report[] = "";
+  
+  // Content & SEO Intelligence
+  $report[] = "📝 **CONTENT & SEO INTELLIGENCE**";
+  $theme = isset($facts['theme']) ? $facts['theme'] : 'Unknown';
+  $active_plugins = isset($facts['active_plugins']) ? count($facts['active_plugins']) : 0;
+  $pages_count = isset($facts['pages_count']) ? $facts['pages_count'] : 'Unknown';
+  $posts_count = isset($facts['posts_count']) ? $facts['posts_count'] : 'Unknown';
+  
+  $report[] = "• Active Theme: " . $theme;
+  $report[] = "• Active Plugins: " . $active_plugins;
+  $report[] = "• Pages: " . $pages_count;
+  $report[] = "• Posts: " . $posts_count;
+  $report[] = "";
+  
+  // Infrastructure Intelligence
+  $report[] = "🏗️ **INFRASTRUCTURE INTELLIGENCE**";
+  $hosting_provider = isset($facts['hosting_provider']) ? $facts['hosting_provider'] : 'Unknown';
+  $server_info = isset($facts['server_info']) ? $facts['server_info'] : 'Unknown';
+  $cdn_status = isset($facts['cdn_status']) ? $facts['cdn_status'] : 'Not detected';
+  
+  $report[] = "• Hosting Provider: " . $hosting_provider;
+  $report[] = "• Server Info: " . $server_info;
+  $report[] = "• CDN Status: " . $cdn_status;
+  $report[] = "";
+  
+  // Data Streams Intelligence
+  $report[] = "🔄 **DATA STREAMS INTELLIGENCE**";
+  $streams_count = isset($facts['data_streams_count']) ? $facts['data_streams_count'] : 0;
+  $active_streams = isset($facts['active_streams']) ? $facts['active_streams'] : 0;
+  $last_sync = isset($facts['last_sync']) ? $facts['last_sync'] : 'Unknown';
+  
+  $report[] = "• Total Data Streams: " . $streams_count;
+  $report[] = "• Active Streams: " . $active_streams;
+  $report[] = "• Last Sync: " . $last_sync;
+  $report[] = "";
+  
+  // Recommendations & Insights
+  $report[] = "💡 **RECOMMENDATIONS & INSIGHTS**";
+  
+  // Health-based recommendations
+  if (is_numeric($health_score)) {
+    if ($health_score >= 90) {
+      $report[] = "• ✅ Excellent system health - maintain current practices";
+    } elseif ($health_score >= 70) {
+      $report[] = "• ⚠️ Good health with room for improvement - consider optimization";
+    } else {
+      $report[] = "• 🚨 Health score needs attention - review system performance";
+    }
+  }
+  
+  // Security recommendations
+  if (!$tls_valid) {
+    $report[] = "• 🔒 SSL/TLS certificate needs attention";
+  }
+  
+  if ($mfa_status === 'Not configured') {
+    $report[] = "• 🔐 Consider implementing Multi-Factor Authentication";
+  }
+  
+  // Analytics recommendations
+  if (!isset($facts['ga4_metrics'])) {
+    $report[] = "• 📊 Set up Google Analytics 4 for detailed traffic insights";
+  }
+  
+  $report[] = "";
+  $report[] = "📋 **REPORT SUMMARY**";
+  $report[] = "This intelligence report is generated from your Visible Light Hub data and provides a comprehensive overview of your website's performance, security, and analytics. Use this information to make informed decisions about optimizations and improvements.";
+  $report[] = "";
+  $report[] = "For detailed analysis of any specific area, ask me about particular aspects like 'security status', 'analytics data', or 'system performance'.";
+  
+  return implode("\n", $report);
 }
