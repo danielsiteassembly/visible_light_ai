@@ -106,7 +106,7 @@ add_action('rest_api_init', function () {
       if (!$license) {
         return new WP_REST_Response(['error' => 'License required'], 401);
       }
-      
+
       // Find the license ID from the license key
       $licenses = get_option('vl_licenses_registry', []);
       $license_id = null;
@@ -116,63 +116,43 @@ add_action('rest_api_init', function () {
           break;
         }
       }
-      
+
       if (!$license_id) {
         return new WP_REST_Response(['error' => 'License not found'], 404);
       }
-      
+
       // Handle POST (store data from client)
       if ($req->get_method() === 'POST') {
         $comprehensive_data = $req->get_json_params();
         if (!$comprehensive_data) {
           return new WP_REST_Response(['error' => 'Invalid comprehensive data'], 400);
         }
-        
+
         // Store comprehensive data in Hub profiles
         $profiles = get_option('vl_hub_profiles', []);
         if (!isset($profiles[$license_id])) {
           $profiles[$license_id] = [];
         }
-        
+
         // Update with comprehensive data
         $profiles[$license_id] = array_merge($profiles[$license_id], $comprehensive_data);
         $profiles[$license_id]['last_updated'] = current_time('mysql');
-        
+
         update_option('vl_hub_profiles', $profiles);
-        
+
         error_log('[Luna Hub] Stored comprehensive data for license_id: ' . $license_id);
-        
+
         return new WP_REST_Response(['ok' => true, 'message' => 'Comprehensive data stored'], 200);
       }
-      
+
       // Handle GET (return data to client)
-      $profiles = get_option('vl_hub_profiles', []);
-      $client_profile = $profiles[$license_id] ?? null;
-      
-      if (!$client_profile) {
-        return new WP_REST_Response(['error' => 'Client profile not found'], 404);
+      $profile = vl_hub_profile_resolve($license, ['force_refresh' => (bool) $req->get_param('refresh')]);
+      if (is_wp_error($profile)) {
+        $status = (int) ($profile->get_error_data('status') ?? 500);
+        return new WP_REST_Response(['error' => $profile->get_error_message()], $status);
       }
-      
-      // Return client's comprehensive data
-      return new WP_REST_Response([
-        'home_url' => $client_profile['site'] ?? home_url(),
-        'https' => !empty($client_profile['https']),
-        'wordpress' => [
-          'version' => $client_profile['wp_version'] ?? '',
-          'theme' => [
-            'name' => $client_profile['theme']['name'] ?? '',
-            'version' => $client_profile['theme']['version'] ?? '',
-            'is_active' => !empty($client_profile['theme']['is_active']),
-          ],
-        ],
-        'plugins' => $client_profile['plugins'] ?? [],
-        'themes' => $client_profile['themes'] ?? [],
-        'users' => $client_profile['users'] ?? [],
-        'security' => $client_profile['security'] ?? [],
-        '_posts' => $client_profile['_posts'] ?? [],
-        '_pages' => $client_profile['_pages'] ?? [],
-        '_users' => $client_profile['_users'] ?? [],
-      ], 200);
+
+      return new WP_REST_Response($profile, 200);
     }
   ]);
 });
@@ -233,6 +213,332 @@ add_action('rest_api_init', function () {
       
       return new WP_REST_Response(['ok' => true, 'message' => 'Security data stored'], 200);
     }
+  ]);
+});
+
+/* =========================================================================
+ * Hub profile utilities
+ * ========================================================================= */
+
+/**
+ * Resolve a license key to its registry record.
+ */
+function vl_hub_find_license_record(string $license_key): array {
+  $licenses = get_option('vl_licenses_registry', []);
+  foreach ($licenses as $id => $row) {
+    if (isset($row['key']) && hash_equals((string) $row['key'], $license_key)) {
+      return ['id' => $id, 'record' => is_array($row) ? $row : [], 'license' => $license_key];
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Determine whether a stored profile is missing WordPress inventory details.
+ */
+function vl_hub_profile_missing_inventory(array $profile): bool {
+  $required_arrays = ['posts', 'pages', 'plugins', 'themes', 'users'];
+  foreach ($required_arrays as $key) {
+    if (!array_key_exists($key, $profile) || !is_array($profile[$key])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Fetch a remote endpoint from a client site with the given license header.
+ */
+function vl_hub_fetch_client_endpoint(string $site_url, string $path, string $license_key, array $query = []) {
+  $site_url = trim($site_url);
+  if ($site_url === '') {
+    return null;
+  }
+
+  $base = rtrim($site_url, '/');
+  $url  = $base . $path;
+  if ($query) {
+    $url = add_query_arg($query, $url);
+  }
+
+  $response = wp_remote_get($url, [
+    'timeout'   => 15,
+    'headers'   => [
+      'X-Luna-License' => $license_key,
+      'Accept'         => 'application/json',
+    ],
+    'sslverify' => false,
+  ]);
+
+  if (is_wp_error($response)) {
+    error_log('[Luna Hub] Failed to fetch client endpoint ' . $url . ': ' . $response->get_error_message());
+    return null;
+  }
+
+  $code = (int) wp_remote_retrieve_response_code($response);
+  if ($code < 200 || $code >= 300) {
+    error_log('[Luna Hub] HTTP ' . $code . ' fetching client endpoint ' . $url);
+    return null;
+  }
+
+  $body = json_decode(wp_remote_retrieve_body($response), true);
+  if (!is_array($body)) {
+    error_log('[Luna Hub] Invalid JSON from client endpoint ' . $url);
+    return null;
+  }
+
+  return $body;
+}
+
+/**
+ * Refresh the stored profile for a license by querying the client site directly.
+ */
+function vl_hub_refresh_profile_from_client(array $license_info, array $profile = []): array {
+  $license_key   = $license_info['license'];
+  $license_id    = $license_info['id'];
+  $license_record= $license_info['record'];
+  $site_url      = isset($license_record['site']) ? (string) $license_record['site'] : '';
+
+  if ($site_url === '') {
+    return $profile;
+  }
+
+  if (!is_array($profile)) {
+    $profile = [];
+  }
+
+  // System snapshot (site + WordPress + plugins/themes overview)
+  $system_snapshot = vl_hub_fetch_client_endpoint($site_url, '/wp-json/luna_widget/v1/system/site', $license_key);
+  if (is_array($system_snapshot)) {
+    if (isset($system_snapshot['site']) && is_array($system_snapshot['site'])) {
+      $profile['site'] = $system_snapshot['site'];
+    }
+    if (isset($system_snapshot['wordpress']) && is_array($system_snapshot['wordpress'])) {
+      $profile['wordpress'] = $system_snapshot['wordpress'];
+    }
+    if (isset($system_snapshot['plugins']) && is_array($system_snapshot['plugins'])) {
+      $profile['plugins'] = $system_snapshot['plugins'];
+    }
+    if (isset($system_snapshot['themes']) && is_array($system_snapshot['themes'])) {
+      $profile['themes'] = $system_snapshot['themes'];
+    }
+  }
+
+  // Detailed plugin inventory
+  $plugins_response = vl_hub_fetch_client_endpoint($site_url, '/wp-json/luna_widget/v1/plugins', $license_key);
+  if (is_array($plugins_response) && isset($plugins_response['items']) && is_array($plugins_response['items'])) {
+    $profile['plugins'] = $plugins_response['items'];
+  }
+
+  // Detailed theme inventory
+  $themes_response = vl_hub_fetch_client_endpoint($site_url, '/wp-json/luna_widget/v1/themes', $license_key);
+  if (is_array($themes_response) && isset($themes_response['items']) && is_array($themes_response['items'])) {
+    $profile['themes'] = $themes_response['items'];
+  }
+
+  // Posts and pages
+  $posts_response = vl_hub_fetch_client_endpoint($site_url, '/wp-json/luna_widget/v1/content/posts', $license_key, ['per_page' => 100]);
+  if (is_array($posts_response)) {
+    $profile['posts'] = isset($posts_response['items']) && is_array($posts_response['items']) ? $posts_response['items'] : [];
+    if (!isset($profile['content']) || !is_array($profile['content'])) {
+      $profile['content'] = [];
+    }
+    if (isset($posts_response['total'])) {
+      $profile['content']['posts_total'] = (int) $posts_response['total'];
+    }
+  }
+
+  $pages_response = vl_hub_fetch_client_endpoint($site_url, '/wp-json/luna_widget/v1/content/pages', $license_key, ['per_page' => 100]);
+  if (is_array($pages_response)) {
+    $profile['pages'] = isset($pages_response['items']) && is_array($pages_response['items']) ? $pages_response['items'] : [];
+    if (!isset($profile['content']) || !is_array($profile['content'])) {
+      $profile['content'] = [];
+    }
+    if (isset($pages_response['total'])) {
+      $profile['content']['pages_total'] = (int) $pages_response['total'];
+    }
+  }
+
+  // Users roster
+  $users_response = vl_hub_fetch_client_endpoint($site_url, '/wp-json/luna_widget/v1/users', $license_key, ['per_page' => 100]);
+  if (is_array($users_response)) {
+    $profile['users'] = isset($users_response['items']) && is_array($users_response['items']) ? $users_response['items'] : [];
+    if (isset($users_response['total'])) {
+      $profile['users_total'] = (int) $users_response['total'];
+    }
+  }
+
+  // Populate counts
+  $posts_total  = isset($profile['content']['posts_total']) ? (int) $profile['content']['posts_total'] : (is_array($profile['posts'] ?? null) ? count($profile['posts']) : 0);
+  $pages_total  = isset($profile['content']['pages_total']) ? (int) $profile['content']['pages_total'] : (is_array($profile['pages'] ?? null) ? count($profile['pages']) : 0);
+  $users_total  = isset($profile['users_total']) ? (int) $profile['users_total'] : (is_array($profile['users'] ?? null) ? count($profile['users']) : 0);
+  $plugins_total= is_array($profile['plugins'] ?? null) ? count($profile['plugins']) : 0;
+
+  $profile['counts'] = [
+    'posts'   => $posts_total,
+    'pages'   => $pages_total,
+    'users'   => $users_total,
+    'plugins' => $plugins_total,
+  ];
+
+  // Maintain legacy underscore keys expected by some consumers
+  $profile['_posts'] = $profile['posts'] ?? [];
+  $profile['_pages'] = $profile['pages'] ?? [];
+  $profile['_users'] = $profile['users'] ?? [];
+
+  // Ensure base metadata is available
+  $home_url = $profile['site']['home_url'] ?? ($license_record['site'] ?? '');
+  if ($home_url) {
+    $profile['home_url'] = $home_url;
+  }
+  if (!isset($profile['https'])) {
+    if (isset($profile['site']['https'])) {
+      $profile['https'] = (bool) $profile['site']['https'];
+    } elseif ($home_url) {
+      $profile['https'] = (stripos($home_url, 'https://') === 0);
+    }
+  }
+
+  $profile['license_id']   = $license_id;
+  $profile['license_key']  = $license_key;
+  if (!isset($profile['client_name']) && !empty($license_record['client'])) {
+    $profile['client_name'] = $license_record['client'];
+  }
+
+  $profile['profile_last_synced'] = current_time('mysql');
+
+  return $profile;
+}
+
+/**
+ * Resolve and optionally refresh the stored profile for a license key.
+ */
+function vl_hub_profile_resolve(string $license_key, array $options = []) {
+  $license_info = vl_hub_find_license_record($license_key);
+  if (!$license_info) {
+    return new WP_Error('license_not_found', __('License not found', 'visible-light'), ['status' => 404]);
+  }
+
+  $profiles = get_option('vl_hub_profiles', []);
+  $stored   = isset($profiles[$license_info['id']]) && is_array($profiles[$license_info['id']]) ? $profiles[$license_info['id']] : [];
+
+  $force_refresh = !empty($options['force_refresh']);
+  if ($force_refresh || vl_hub_profile_missing_inventory($stored)) {
+    $stored = vl_hub_refresh_profile_from_client($license_info, $stored);
+    $profiles[$license_info['id']] = $stored;
+    update_option('vl_hub_profiles', $profiles);
+  }
+
+  if (!is_array($stored)) {
+    $stored = [];
+  }
+
+  if (empty($stored)) {
+    $home_url = isset($license_info['record']['site']) ? (string) $license_info['record']['site'] : '';
+    $stored = [
+      'site'    => ['home_url' => $home_url, 'https' => stripos($home_url, 'https://') === 0],
+      'posts'   => [],
+      'pages'   => [],
+      'plugins' => [],
+      'themes'  => [],
+      'users'   => [],
+      'content' => [],
+    ];
+  }
+
+  if (!isset($stored['posts']) && isset($stored['_posts']) && is_array($stored['_posts'])) {
+    $stored['posts'] = $stored['_posts'];
+  }
+  if (!isset($stored['pages']) && isset($stored['_pages']) && is_array($stored['_pages'])) {
+    $stored['pages'] = $stored['_pages'];
+  }
+  if (!isset($stored['users']) && isset($stored['_users']) && is_array($stored['_users'])) {
+    $stored['users'] = $stored['_users'];
+  }
+
+  if (!isset($stored['license_id'])) {
+    $stored['license_id'] = $license_info['id'];
+  }
+  if (!isset($stored['license_key'])) {
+    $stored['license_key'] = $license_key;
+  }
+  if (!isset($stored['client_name']) && !empty($license_info['record']['client'])) {
+    $stored['client_name'] = $license_info['record']['client'];
+  }
+
+  if (!isset($stored['home_url'])) {
+    $stored['home_url'] = $stored['site']['home_url'] ?? ($license_info['record']['site'] ?? '');
+  }
+  if (!isset($stored['https'])) {
+    if (isset($stored['site']['https'])) {
+      $stored['https'] = (bool) $stored['site']['https'];
+    } elseif (!empty($stored['home_url'])) {
+      $stored['https'] = stripos($stored['home_url'], 'https://') === 0;
+    }
+  }
+
+  if (!isset($stored['counts']) || !is_array($stored['counts'])) {
+    $stored['counts'] = [];
+  }
+  $stored['counts']['posts'] = isset($stored['content']['posts_total']) ? (int) $stored['content']['posts_total'] : (is_array($stored['posts'] ?? null) ? count($stored['posts']) : 0);
+  $stored['counts']['pages'] = isset($stored['content']['pages_total']) ? (int) $stored['content']['pages_total'] : (is_array($stored['pages'] ?? null) ? count($stored['pages']) : 0);
+  $stored['counts']['users'] = isset($stored['users_total']) ? (int) $stored['users_total'] : (is_array($stored['users'] ?? null) ? count($stored['users']) : 0);
+  $stored['counts']['plugins'] = is_array($stored['plugins'] ?? null) ? count($stored['plugins']) : 0;
+
+  if (!isset($stored['profile_last_synced'])) {
+    $stored['profile_last_synced'] = current_time('mysql');
+  }
+
+  return $stored;
+}
+
+/* =========================================================================
+ * VL Hub profile endpoint
+ * ========================================================================= */
+
+add_action('rest_api_init', function () {
+  register_rest_route('vl-hub/v1', '/profile', [
+    'methods' => ['GET', 'POST'],
+    'permission_callback' => '__return_true',
+    'callback' => function (WP_REST_Request $req) {
+      $license = $req->get_header('X-Luna-License') ?: $req->get_param('license');
+      if (!$license) {
+        return new WP_REST_Response(['error' => 'License required'], 401);
+      }
+
+      if ($req->get_method() === 'POST') {
+        $license_info = vl_hub_find_license_record($license);
+        if (!$license_info) {
+          return new WP_REST_Response(['error' => 'License not found'], 404);
+        }
+
+        $payload = $req->get_json_params();
+        if (!is_array($payload)) {
+          return new WP_REST_Response(['error' => 'Invalid profile payload'], 400);
+        }
+
+        $profiles = get_option('vl_hub_profiles', []);
+        $current  = isset($profiles[$license_info['id']]) && is_array($profiles[$license_info['id']]) ? $profiles[$license_info['id']] : [];
+        $profiles[$license_info['id']] = array_merge($current, $payload, [
+          'license_id'          => $license_info['id'],
+          'license_key'         => $license,
+          'profile_last_synced' => current_time('mysql'),
+        ]);
+        update_option('vl_hub_profiles', $profiles);
+
+        return new WP_REST_Response(['ok' => true, 'message' => 'Profile stored'], 200);
+      }
+
+      $profile = vl_hub_profile_resolve($license, ['force_refresh' => (bool) $req->get_param('refresh')]);
+      if (is_wp_error($profile)) {
+        $status = (int) ($profile->get_error_data('status') ?? 500);
+        return new WP_REST_Response(['error' => $profile->get_error_message()], $status);
+      }
+
+      return new WP_REST_Response($profile, 200);
+    },
   ]);
 });
 
