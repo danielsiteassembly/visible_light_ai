@@ -3106,6 +3106,99 @@ final class VL_License_Manager {
             'sessions' => __('Sessions', 'visible-light'),
             'screenPageViews' => __('Page Views', 'visible-light'),
         );
+
+        if (!empty($ga4_settings['ga4_measurement_id'])) {
+            $stream['ga4_measurement_id'] = $ga4_settings['ga4_measurement_id'];
+        }
+
+        if (!empty($report_data['rows']) && is_array($report_data['rows'])) {
+            $rows = $report_data['rows'];
+            if (count($rows) > 10) {
+                $rows = array_slice($rows, 0, 10);
+            }
+            $stream['ga4_rows'] = $rows;
+        }
+
+        $all_streams[$license_key][$stream_id] = $stream;
+        self::data_streams_store_set($all_streams);
+    }
+
+    private static function remove_ga4_stream($license_key, $property_id) {
+        if (empty($license_key) || empty($property_id)) {
+            return;
+        }
+
+        $all_streams = self::data_streams_store_get();
+        if (empty($all_streams[$license_key])) {
+            return;
+        }
+
+        $stream_id = self::get_ga4_stream_id($property_id);
+        if (isset($all_streams[$license_key][$stream_id])) {
+            unset($all_streams[$license_key][$stream_id]);
+            self::data_streams_store_set($all_streams);
+        }
+    }
+
+    private static function get_ga4_stream_id($property_id) {
+        $clean_id = strtolower(preg_replace('/[^a-zA-Z0-9_\-]/', '_', (string) $property_id));
+        return 'ga4_' . $clean_id;
+    }
+
+    private static function get_ga4_stream_data($license_key, $property_id) {
+        if (empty($license_key) || empty($property_id)) {
+            return null;
+        }
+
+        $all_streams = self::data_streams_store_get();
+        $stream_id = self::get_ga4_stream_id($property_id);
+
+        return $all_streams[$license_key][$stream_id] ?? null;
+    }
+
+    private static function describe_ga4_date_range($range) {
+        if (empty($range) || !is_array($range)) {
+            return '';
+        }
+
+        $start = self::resolve_ga4_relative_date($range['startDate'] ?? '');
+        $end = self::resolve_ga4_relative_date($range['endDate'] ?? '');
+
+        if (!$start || !$end) {
+            $start_raw = $range['startDate'] ?? '';
+            $end_raw = $range['endDate'] ?? '';
+            if ($start_raw || $end_raw) {
+                return trim($start_raw . ' – ' . $end_raw);
+            }
+            return '';
+        }
+
+        $format = get_option('date_format');
+        return date_i18n($format, $start) . ' – ' . date_i18n($format, $end);
+    }
+
+    private static function resolve_ga4_relative_date($value) {
+        if (empty($value) || !is_string($value)) {
+            return false;
+        }
+
+        $value = trim($value);
+
+        if ($value === 'today') {
+            return current_time('timestamp');
+        }
+
+        if ($value === 'yesterday') {
+            return current_time('timestamp') - DAY_IN_SECONDS;
+        }
+
+        if (preg_match('/^(\d+)daysAgo$/', $value, $matches)) {
+            $days = (int) $matches[1];
+            return current_time('timestamp') - ($days * DAY_IN_SECONDS);
+        }
+
+        $timestamp = strtotime($value);
+        return $timestamp ? $timestamp : false;
     }
 
     private static function store_ga4_stream($license_key, $ga4_settings, $report_data, $synced_at = null) {
