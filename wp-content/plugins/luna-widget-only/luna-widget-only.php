@@ -923,12 +923,6 @@ function luna_profile_facts() {
     'generated'  => gmdate('c'),
   );
 
-  $facts['plugins'] = is_array($plugins_items) ? $plugins_items : array();
-  $facts['themes']  = is_array($themes_items) ? $themes_items : array();
-  $facts['posts']   = is_array($posts_items) ? $posts_items : array();
-  $facts['pages']   = is_array($pages_items) ? $pages_items : array();
-  $facts['users']   = $users_items;
-
   if ($license) {
     $ga4_info = luna_fetch_ga4_metrics_from_hub($license);
     if ($ga4_info && isset($ga4_info['metrics'])) {
@@ -1150,15 +1144,39 @@ function luna_profile_facts_comprehensive() {
       'themes'  => $theme_updates,
       'core'    => $core_updates,
     ),
-    'generated'     => gmdate('c'),
-    'comprehensive' => true,
-    'plugins'       => is_array($plugins_items) ? $plugins_items : array(),
-    'users'         => $users_items,
-    'themes'        => is_array($themes_items) ? $themes_items : array(),
-    'posts'         => is_array($posts_items) ? $posts_items : array(),
-    'pages'         => is_array($pages_items) ? $pages_items : array(),
-    'security'      => isset($comprehensive['security']) && is_array($comprehensive['security']) ? $comprehensive['security'] : array(),
+    'generated'  => gmdate('c'),
+    'comprehensive' => true, // Flag to indicate this is comprehensive data
+    'plugins' => isset($comprehensive['plugins']) ? $comprehensive['plugins'] : array(),
+    'users' => isset($comprehensive['users']) ? $comprehensive['users'] : array(),
+    'themes' => isset($comprehensive['themes']) ? $comprehensive['themes'] : array(),
+    'posts' => isset($comprehensive['_posts']['items']) ? $comprehensive['_posts']['items'] : array(),
+    'pages' => isset($comprehensive['_pages']['items']) ? $comprehensive['_pages']['items'] : array(),
+    'security' => isset($comprehensive['security']) ? $comprehensive['security'] : array(), // Add security data
   );
+  
+  $ga4_info = null;
+  if (isset($comprehensive['ga4_metrics']) && is_array($comprehensive['ga4_metrics'])) {
+    $ga4_info = array(
+      'metrics'        => $comprehensive['ga4_metrics'],
+      'last_synced'    => isset($comprehensive['ga4_last_synced']) ? $comprehensive['ga4_last_synced'] : (isset($comprehensive['last_synced']) ? $comprehensive['last_synced'] : null),
+      'date_range'     => isset($comprehensive['ga4_date_range']) ? $comprehensive['ga4_date_range'] : null,
+      'source_url'     => isset($comprehensive['ga4_source_url']) ? $comprehensive['ga4_source_url'] : (isset($comprehensive['source_url']) ? $comprehensive['source_url'] : null),
+      'property_id'    => isset($comprehensive['ga4_property_id']) ? $comprehensive['ga4_property_id'] : null,
+      'measurement_id' => isset($comprehensive['ga4_measurement_id']) ? $comprehensive['ga4_measurement_id'] : null,
+    );
+    error_log('[Luna] GA4 metrics present in comprehensive payload.');
+  } else {
+    error_log('[Luna] No GA4 metrics in comprehensive payload, attempting data streams fetch.');
+    $ga4_info = luna_fetch_ga4_metrics_from_hub($license);
+  }
+
+  if ($ga4_info && isset($ga4_info['metrics'])) {
+    $facts['ga4_metrics'] = $ga4_info['metrics'];
+    if (!empty($ga4_info['last_synced'])) {
+      $facts['ga4_last_synced'] = $ga4_info['last_synced'];
+    }
+    $facts['updates']['plugins'] = $plugin_updates;
+  }
   
   $ga4_info = null;
   if (isset($comprehensive['ga4_metrics']) && is_array($comprehensive['ga4_metrics'])) {
