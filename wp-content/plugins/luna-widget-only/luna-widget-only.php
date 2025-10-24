@@ -549,6 +549,124 @@ add_action('init', function () {
   ));
 });
 
+/* ============================================================
+ * CANNED RESPONSES FALLBACK
+ * ============================================================ */
+add_action('init', function () {
+  $labels = array(
+    'name'               => __('Canned Responses', 'luna'),
+    'singular_name'      => __('Canned Response', 'luna'),
+    'add_new'            => __('Add New', 'luna'),
+    'add_new_item'       => __('Add New Canned Response', 'luna'),
+    'edit_item'          => __('Edit Canned Response', 'luna'),
+    'new_item'           => __('New Canned Response', 'luna'),
+    'view_item'          => __('View Canned Response', 'luna'),
+    'search_items'       => __('Search Canned Responses', 'luna'),
+    'not_found'          => __('No canned responses found.', 'luna'),
+    'not_found_in_trash' => __('No canned responses found in Trash.', 'luna'),
+    'menu_name'          => __('Canned Responses', 'luna'),
+  );
+
+  register_post_type('luna_canned_response', array(
+    'labels'              => $labels,
+    'public'              => false,
+    'show_ui'             => true,
+    'show_in_menu'        => true,
+    'show_in_rest'        => true,
+    'capability_type'     => 'post',
+    'map_meta_cap'        => true,
+    'supports'            => array('title', 'editor', 'revisions'),
+    'menu_icon'           => 'dashicons-text-page',
+    'menu_position'       => 26,
+  ));
+});
+
+function luna_widget_normalize_prompt_text($value) {
+  $value = is_string($value) ? $value : '';
+  $value = wp_strip_all_tags($value);
+  $value = html_entity_decode($value, ENT_QUOTES, get_option('blog_charset', 'UTF-8'));
+  $value = preg_replace('/\s+/u', ' ', $value);
+  return trim($value);
+}
+
+function luna_widget_prepare_canned_response_content($content) {
+  $content = (string) apply_filters('the_content', $content);
+  $content = str_replace(array("\r\n", "\r"), "\n", $content);
+  $content = preg_replace('/<\s*br\s*\/?\s*>/i', "\n", $content);
+  $content = preg_replace('/<\/(p|div|li|h[1-6])\s*>/i', '</$1>\n\n', $content);
+  $content = wp_strip_all_tags($content);
+  $content = html_entity_decode($content, ENT_QUOTES, get_option('blog_charset', 'UTF-8'));
+  $content = preg_replace("/\n{3,}/", "\n\n", $content);
+  return trim($content);
+}
+
+function luna_widget_find_canned_response($prompt) {
+  $normalized = luna_widget_normalize_prompt_text($prompt);
+  if ($normalized === '') {
+    return null;
+  }
+
+  $posts = get_posts(array(
+    'post_type'        => 'luna_canned_response',
+    'post_status'      => 'publish',
+    'numberposts'      => -1,
+    'orderby'          => array('menu_order' => 'ASC', 'title' => 'ASC'),
+    'order'            => 'ASC',
+    'suppress_filters' => false,
+  ));
+
+  if (empty($posts)) {
+    return null;
+  }
+
+  $normalized_lc = function_exists('mb_strtolower') ? mb_strtolower($normalized, 'UTF-8') : strtolower($normalized);
+  $best = null;
+  $best_score = 0.0;
+
+  foreach ($posts as $post) {
+    $title_normalized = luna_widget_normalize_prompt_text($post->post_title);
+    if ($title_normalized === '') {
+      continue;
+    }
+    $title_lc = function_exists('mb_strtolower') ? mb_strtolower($title_normalized, 'UTF-8') : strtolower($title_normalized);
+
+    if ($title_lc === $normalized_lc) {
+      return array(
+        'id'      => $post->ID,
+        'title'   => $post->post_title,
+        'content' => luna_widget_prepare_canned_response_content($post->post_content),
+      );
+    }
+
+    $score = 0.0;
+    if (function_exists('similar_text')) {
+      similar_text($normalized_lc, $title_lc, $percent);
+      $score = (float) $percent;
+    } elseif (function_exists('levenshtein')) {
+      $distance = levenshtein($normalized_lc, $title_lc);
+      $max_len = max(strlen($normalized_lc), strlen($title_lc), 1);
+      $score = 100.0 - (min($distance, $max_len) / $max_len * 100.0);
+    } else {
+      $score = strpos($normalized_lc, $title_lc) !== false || strpos($title_lc, $normalized_lc) !== false ? 100.0 : 0.0;
+    }
+
+    if ($score > $best_score) {
+      $best_score = $score;
+      $best = $post;
+    }
+  }
+
+  if ($best && $best_score >= 55.0) {
+    return array(
+      'id'      => $best->ID,
+      'title'   => $best->post_title,
+      'content' => luna_widget_prepare_canned_response_content($best->post_content),
+    );
+  }
+
+  return null;
+}
+
 function luna_widget_create_conversation_post($cid) {
   $pid = wp_insert_post(array(
     'post_type'   => 'luna_widget_convo',
@@ -921,6 +1039,7 @@ function luna_profile_facts() {
       'core'    => $core_updates,
     ),
     'generated'  => gmdate('c'),
+    'comprehensive' => false,
   );
 
   if ($license) {
@@ -945,6 +1064,8 @@ function luna_profile_facts() {
     }
   }
 
+  $facts['__source'] = 'basic';
+
   return $facts;
 }
 
@@ -967,7 +1088,9 @@ function luna_profile_facts_comprehensive() {
   $license = luna_get_license();
   if (!$license) {
     error_log('[Luna] No license key found, falling back to basic facts');
-    return luna_profile_facts(); // fallback to basic facts
+    $fallback = luna_profile_facts(); // fallback to basic facts
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback;
   }
   
   // Try to fetch comprehensive data from VL Hub profile
@@ -984,7 +1107,9 @@ function luna_profile_facts_comprehensive() {
   
   if (is_wp_error($response)) {
     error_log('[Luna] Error fetching comprehensive data: ' . $response->get_error_message());
-    return luna_profile_facts(); // fallback
+    $fallback = luna_profile_facts();
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback; // fallback
   }
   
   $code = wp_remote_retrieve_response_code($response);
@@ -992,13 +1117,17 @@ function luna_profile_facts_comprehensive() {
   
   if ($code < 200 || $code >= 300) {
     error_log('[Luna] HTTP error, falling back to basic facts');
-    return luna_profile_facts(); // fallback
+    $fallback = luna_profile_facts();
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback; // fallback
   }
   
   $comprehensive = json_decode(wp_remote_retrieve_body($response), true);
   if (!is_array($comprehensive)) {
     error_log('[Luna] Invalid JSON response, falling back to basic facts');
-    return luna_profile_facts(); // fallback
+    $fallback = luna_profile_facts();
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback; // fallback
   }
   
   error_log('[Luna] Successfully fetched comprehensive data: ' . print_r($comprehensive, true));
@@ -1217,6 +1346,8 @@ function luna_profile_facts_comprehensive() {
   }
 
   error_log('[Luna] Built comprehensive facts: ' . print_r($facts, true));
+
+  $facts['__source'] = 'comprehensive';
 
   return $facts;
 }
@@ -2225,6 +2356,21 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
       $answer = "Your installed plugins are: " . implode(", ", $plugin_list) . ".";
     } else {
       $answer = "I don't see any plugins installed on your site.";
+    }
+  }
+
+  if ($answer === '') {
+    $facts_source = isset($facts['__source']) ? $facts['__source'] : ((isset($facts['comprehensive']) && $facts['comprehensive']) ? 'comprehensive' : 'basic');
+    if ($facts_source !== 'comprehensive') {
+      $canned = luna_widget_find_canned_response($prompt);
+      if (is_array($canned) && !empty($canned['content'])) {
+        $answer = $canned['content'];
+        $meta['source'] = 'canned_response';
+        $meta['canned_id'] = $canned['id'];
+        if (!empty($canned['title'])) {
+          $meta['canned_title'] = $canned['title'];
+        }
+      }
     }
   }
 
