@@ -239,11 +239,17 @@ add_action('wp_enqueue_scripts', function () {
 		}
 	}
 
-	// Always load on the response route (/products/luna/chat/response/*)
-	$req_path = trim( $_SERVER['REQUEST_URI'] ?? '', '/' );
-	if ( strpos( $req_path, 'products/luna/chat/response' ) !== false ) {
-		$should_load = true;
-	}
+        // Always load on the response route (/products/luna/chat/response/*)
+        $req_path = trim( $_SERVER['REQUEST_URI'] ?? '', '/' );
+        if ( strpos( $req_path, 'products/luna/chat/response' ) !== false ) {
+                $should_load = true;
+        }
+
+        // The Luna composer page itself does not always use the shortcode, so also
+        // enqueue the script whenever the request path points at the Luna product hub.
+        if ( strpos( $req_path, 'products/luna' ) === 0 ) {
+                $should_load = true;
+        }
 
 	if ( ! $should_load ) return;
 
@@ -269,11 +275,13 @@ add_action('wp_enqueue_scripts', function () {
 			true
 		);
 
-		wp_localize_script($handle, 'lunaVars', [
-			'restUrlChat' => esc_url_raw(rest_url('luna/v1/chat')),       // existing CPT/polling flow
-			'restUrlLive' => esc_url_raw(rest_url('luna/v1/chat-live')),  // new live proxy
-			'nonce'       => wp_create_nonce('wp_rest'),
-		]);
+                wp_localize_script($handle, 'lunaVars', [
+                        'restUrlChat'    => esc_url_raw(rest_url('luna_widget/v1/chat')),
+                        'restUrlCompose' => esc_url_raw(rest_url('luna_compose/v1/respond')),
+                        'restUrlLive'    => esc_url_raw(rest_url('luna/v1/chat-live')),
+                        'composeClient'  => 'commonwealthhealthservices',
+                        'nonce'          => wp_create_nonce('wp_rest'),
+                ]);
 
 		// Admin-only breadcrumb to confirm enqueue
 		if ( current_user_can( 'manage_options' ) ) {
@@ -313,8 +321,8 @@ setTimeout(function(){
  * (Safe to keep; your plugin also registers it.)
  */
 add_filter( 'query_vars', function ( $vars ) {
-	$vars[] = 'luna_req_id';
-	return $vars;
+        $vars[] = 'luna_req_id';
+        return $vars;
 } );
 
 add_action('admin_init', function () {
