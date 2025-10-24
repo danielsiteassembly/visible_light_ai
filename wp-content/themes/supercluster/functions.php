@@ -269,11 +269,13 @@ add_action('wp_enqueue_scripts', function () {
 			true
 		);
 
-		wp_localize_script($handle, 'lunaVars', [
-			'restUrlChat' => esc_url_raw(rest_url('luna/v1/chat')),       // existing CPT/polling flow
-			'restUrlLive' => esc_url_raw(rest_url('luna/v1/chat-live')),  // new live proxy
-			'nonce'       => wp_create_nonce('wp_rest'),
-		]);
+                wp_localize_script($handle, 'lunaVars', [
+                        'restUrlChat'    => esc_url_raw(rest_url('luna_widget/v1/chat')),
+                        'restUrlCompose' => esc_url_raw(rest_url('luna_compose/v1/respond')),
+                        'restUrlLive'    => esc_url_raw(rest_url('luna/v1/chat-live')),
+                        'composeClient'  => 'commonwealthhealthservices',
+                        'nonce'          => wp_create_nonce('wp_rest'),
+                ]);
 
 		// Admin-only breadcrumb to confirm enqueue
 		if ( current_user_can( 'manage_options' ) ) {
@@ -313,8 +315,8 @@ setTimeout(function(){
  * (Safe to keep; your plugin also registers it.)
  */
 add_filter( 'query_vars', function ( $vars ) {
-	$vars[] = 'luna_req_id';
-	return $vars;
+        $vars[] = 'luna_req_id';
+        return $vars;
 } );
 
 add_action('admin_init', function () {

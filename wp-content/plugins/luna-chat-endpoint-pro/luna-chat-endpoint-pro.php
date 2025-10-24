@@ -1696,3 +1696,539 @@ function vl_check_client_auth_permissions($request) {
 function vl_check_client_permissions_supercluster($request) {
     return true; // Allow public access for now
 }
+
+/* =========================================================================
+ * Luna Compose long-form endpoint
+ * ========================================================================= */
+if (!function_exists('vl_luna_compose_resolve_profile')) {
+  function vl_luna_compose_resolve_profile(string $client_slug, bool $force_refresh = false) {
+    if (!function_exists('vl_hub_profile_resolve')) {
+      return new WP_Error('missing_dependency', __('VL Hub profile utilities are unavailable.', 'visible-light'), ['status' => 500]);
+    }
+
+    $normalized  = sanitize_title($client_slug ?: 'commonwealthhealthservices');
+    $licenses    = get_option('vl_licenses_registry', []);
+    $license_key = '';
+
+    if (is_array($licenses)) {
+      foreach ($licenses as $id => $row) {
+        $candidate_key = '';
+        if (is_array($row)) {
+          if (!empty($row['key']) && is_string($row['key'])) {
+            $candidate_key = $row['key'];
+          } elseif (is_string($id)) {
+            $candidate_key = $id;
+          }
+        } elseif (is_string($id)) {
+          $candidate_key = $id;
+        }
+
+        if ($candidate_key === '') {
+          continue;
+        }
+
+        $name_slug = '';
+        if (is_array($row) && !empty($row['client_name'])) {
+          $name_slug = sanitize_title($row['client_name']);
+        }
+
+        $site_slug = '';
+        if (is_array($row) && !empty($row['site'])) {
+          $site_slug = sanitize_title(str_replace(['https://', 'http://', 'www.'], '', $row['site']));
+        }
+
+        if ($name_slug === $normalized || $site_slug === $normalized) {
+          $license_key = $candidate_key;
+          break;
+        }
+      }
+    }
+
+    if ($license_key === '') {
+      $fallback_map = [
+        'commonwealthhealthservices' => [
+          'VL-VYAK-9BPQ-NKCC',
+          'VL-GC5K-YKBM-BM5F',
+          'lic_3d2c5795-b6c2-482f-8cb9-cf36603768e8',
+        ],
+      ];
+
+      $candidates = $fallback_map[$normalized] ?? [];
+      foreach ($candidates as $candidate) {
+        if (!function_exists('vl_hub_find_license_record')) {
+          $license_key = $candidate;
+          break;
+        }
+
+        $record = vl_hub_find_license_record($candidate);
+        if (!empty($record)) {
+          $license_key = $candidate;
+          break;
+        }
+
+        if (is_array($licenses)) {
+          $licenses[$candidate] = [
+            'key'         => $candidate,
+            'client'      => 'Commonwealth Health Services',
+            'client_name' => 'Commonwealth Health Services',
+            'site'        => 'https://commonwealthhealthservices.com',
+            'status'      => 'active',
+            'created'     => current_time('mysql'),
+          ];
+          update_option('vl_licenses_registry', $licenses);
+        }
+
+        $license_key = $candidate;
+        break;
+      }
+    }
+
+    if ($license_key === '') {
+      return new WP_Error('client_not_found', __('Unable to locate a VL Hub license for the requested client.', 'visible-light'), ['status' => 404]);
+    }
+
+    $profile = vl_hub_profile_resolve($license_key, ['force_refresh' => $force_refresh]);
+    if (is_wp_error($profile)) {
+      return $profile;
+    }
+
+    if (!is_array($profile)) {
+      return new WP_Error('profile_unavailable', __('The VL Hub profile did not return usable data.', 'visible-light'), ['status' => 500]);
+    }
+
+    if (empty($profile['client_name'])) {
+      $profile['client_name'] = ucwords(str_replace('-', ' ', $normalized));
+    }
+
+    if (empty($profile['home_url'])) {
+      if (!empty($profile['site']['home_url'])) {
+        $profile['home_url'] = $profile['site']['home_url'];
+      } elseif (!empty($profile['site']) && is_string($profile['site'])) {
+        $profile['home_url'] = $profile['site'];
+      } else {
+        $profile['home_url'] = 'https://commonwealthhealthservices.com';
+      }
+    }
+
+    $profile['client_slug'] = $normalized;
+    $profile['license_key'] = $license_key;
+
+    return $profile;
+  }
+}
+
+if (!function_exists('vl_luna_compose_render_answer')) {
+  function vl_luna_compose_render_answer(string $prompt, array $profile): string {
+    $prompt_trimmed = trim($prompt);
+    $client_name    = isset($profile['client_name']) && $profile['client_name'] !== '' ? $profile['client_name'] : 'Commonwealth Health Services';
+    $site_url       = isset($profile['home_url']) && $profile['home_url'] !== '' ? $profile['home_url'] : 'https://commonwealthhealthservices.com';
+    $host           = wp_parse_url($site_url, PHP_URL_HOST);
+    if (!is_string($host) || $host === '') {
+      $host = $site_url;
+    }
+
+    $counts = isset($profile['counts']) && is_array($profile['counts']) ? $profile['counts'] : [];
+    $count_posts   = isset($counts['posts']) ? (int) $counts['posts'] : 0;
+    $count_pages   = isset($counts['pages']) ? (int) $counts['pages'] : 0;
+    $count_users   = isset($counts['users']) ? (int) $counts['users'] : 0;
+    $count_plugins = isset($counts['plugins']) ? (int) $counts['plugins'] : 0;
+
+    $wordpress  = isset($profile['wordpress']) && is_array($profile['wordpress']) ? $profile['wordpress'] : [];
+    $wp_version = '';
+    if (!empty($wordpress['version'])) {
+      $wp_version = (string) $wordpress['version'];
+    } elseif (!empty($wordpress['core']['version'])) {
+      $wp_version = (string) $wordpress['core']['version'];
+    }
+
+    $themes = isset($profile['themes']) && is_array($profile['themes']) ? $profile['themes'] : [];
+    $active_theme = '';
+    foreach ($themes as $theme) {
+      if (!is_array($theme)) {
+        continue;
+      }
+      $is_active = !empty($theme['is_active']) || !empty($theme['active']);
+      if ($is_active) {
+        $label = !empty($theme['name']) ? $theme['name'] : (!empty($theme['title']) ? $theme['title'] : 'Active theme');
+        if (!empty($theme['version'])) {
+          $label .= ' v' . $theme['version'];
+        }
+        $active_theme = $label;
+        break;
+      }
+    }
+    if ($active_theme === '' && !empty($wordpress['theme']['name'])) {
+      $active_theme = (string) $wordpress['theme']['name'];
+      if (!empty($wordpress['theme']['version'])) {
+        $active_theme .= ' v' . $wordpress['theme']['version'];
+      }
+    }
+
+    $plugins = isset($profile['plugins']) && is_array($profile['plugins']) ? $profile['plugins'] : [];
+    $active_plugins = [];
+    $plugin_updates = 0;
+    foreach ($plugins as $plugin) {
+      if (!is_array($plugin)) {
+        continue;
+      }
+      $name = '';
+      if (!empty($plugin['name'])) {
+        $name = (string) $plugin['name'];
+      } elseif (!empty($plugin['title'])) {
+        $name = (string) $plugin['title'];
+      } elseif (!empty($plugin['slug'])) {
+        $name = (string) $plugin['slug'];
+      }
+      if ($name === '') {
+        continue;
+      }
+
+      $is_active = !empty($plugin['is_active']) || !empty($plugin['active']);
+      if ($is_active) {
+        if (!empty($plugin['version'])) {
+          $active_plugins[] = $name . ' v' . $plugin['version'];
+        } else {
+          $active_plugins[] = $name;
+        }
+      }
+
+      if (!empty($plugin['update_available']) || !empty($plugin['updates_available']) || !empty($plugin['update'])) {
+        $plugin_updates++;
+      }
+    }
+    $active_plugins = array_slice($active_plugins, 0, 6);
+
+    $themes_with_updates = 0;
+    foreach ($themes as $theme) {
+      if (!is_array($theme)) {
+        continue;
+      }
+      if (!empty($theme['update_available']) || !empty($theme['updates_available']) || !empty($theme['update'])) {
+        $themes_with_updates++;
+      }
+    }
+
+    $updates      = isset($profile['updates']) && is_array($profile['updates']) ? $profile['updates'] : [];
+    $core_updates = isset($updates['core']) ? (int) $updates['core'] : 0;
+
+    $security  = isset($profile['security']) && is_array($profile['security']) ? $profile['security'] : [];
+    $tls_data  = [];
+    if (!empty($security['tls']) && is_array($security['tls'])) {
+      $tls_data = $security['tls'];
+    } elseif (!empty($profile['tls']) && is_array($profile['tls'])) {
+      $tls_data = $profile['tls'];
+    }
+    $tls_valid   = isset($tls_data['valid']) ? (bool) $tls_data['valid'] : null;
+    $tls_expires = '';
+    foreach (['valid_to', 'expires', 'expires_at', 'not_after'] as $key) {
+      if (!empty($tls_data[$key])) {
+        $tls_expires = (string) $tls_data[$key];
+        break;
+      }
+    }
+    $tls_provider = !empty($tls_data['issuer']) ? (string) $tls_data['issuer'] : (!empty($tls_data['provider_guess']) ? (string) $tls_data['provider_guess'] : '');
+
+    $waf_info      = isset($security['waf']) && is_array($security['waf']) ? $security['waf'] : [];
+    $waf_provider  = !empty($waf_info['provider']) ? (string) $waf_info['provider'] : '';
+    $waf_last_audit= !empty($waf_info['last_audit']) ? (string) $waf_info['last_audit'] : '';
+
+    $ids_info     = isset($security['ids']) && is_array($security['ids']) ? $security['ids'] : [];
+    $ids_provider = !empty($ids_info['provider']) ? (string) $ids_info['provider'] : '';
+    $ids_last_scan= !empty($ids_info['last_scan']) ? (string) $ids_info['last_scan'] : '';
+    $ids_schedule = !empty($ids_info['schedule']) ? (string) $ids_info['schedule'] : '';
+
+    $auth_info        = isset($security['auth']) && is_array($security['auth']) ? $security['auth'] : [];
+    $mfa              = !empty($auth_info['mfa']) ? (string) $auth_info['mfa'] : '';
+    $password_policy  = !empty($auth_info['password_policy']) ? (string) $auth_info['password_policy'] : '';
+    $session_timeout  = !empty($auth_info['session_timeout']) ? (string) $auth_info['session_timeout'] : '';
+    $sso_providers    = !empty($auth_info['sso_providers']) ? (string) $auth_info['sso_providers'] : '';
+
+    $ga4_metrics = [];
+    if (!empty($profile['ga4_metrics']) && is_array($profile['ga4_metrics'])) {
+      $ga4_metrics = $profile['ga4_metrics'];
+    } elseif (!empty($profile['analytics']['ga4']['metrics']) && is_array($profile['analytics']['ga4']['metrics'])) {
+      $ga4_metrics = $profile['analytics']['ga4']['metrics'];
+    }
+    $ga4_range = '';
+    if (!empty($profile['ga4_date_range'])) {
+      $ga4_range = (string) $profile['ga4_date_range'];
+    } elseif (!empty($profile['analytics']['ga4']['date_range'])) {
+      $ga4_range = (string) $profile['analytics']['ga4']['date_range'];
+    }
+
+    $posts     = isset($profile['posts']) && is_array($profile['posts']) ? $profile['posts'] : [];
+    $top_posts = [];
+    foreach ($posts as $post) {
+      if (!is_array($post) || empty($post['title'])) {
+        continue;
+      }
+      $top_posts[] = (string) $post['title'];
+      if (count($top_posts) >= 3) {
+        break;
+      }
+    }
+
+    $last_synced = '';
+    foreach (['profile_last_synced', 'last_updated', 'generated'] as $key) {
+      if (!empty($profile[$key])) {
+        $last_synced = (string) $profile[$key];
+        break;
+      }
+    }
+    if ($last_synced !== '') {
+      $timestamp = strtotime($last_synced);
+      if ($timestamp) {
+        $timezone = get_option('timezone_string');
+        if ($timezone) {
+          $dt = new DateTime('@' . $timestamp);
+          try {
+            $dt->setTimezone(new DateTimeZone($timezone));
+            $last_synced = $dt->format('F j, Y \a\t g:i A T');
+          } catch (Exception $e) {
+            $last_synced = gmdate('F j, Y \a\t g:i A \U\T\C', $timestamp);
+          }
+        } else {
+          $last_synced = gmdate('F j, Y \a\t g:i A \U\T\C', $timestamp);
+        }
+      }
+    }
+
+    $https_status = isset($profile['https']) ? (bool) $profile['https'] : (stripos($site_url, 'https://') === 0);
+
+    $summary_points   = [];
+    $summary_points[] = sprintf('%s is running WordPress %s on %s with HTTPS %s.',
+      $client_name,
+      $wp_version !== '' ? $wp_version : __('(version unknown)', 'visible-light'),
+      $host,
+      $https_status ? __('enforced', 'visible-light') : __('not fully enforced', 'visible-light')
+    );
+    $summary_points[] = sprintf('Visible Light Hub currently tracks %d pages, %d posts, %d users, and %d plugins for this property.', $count_pages, $count_posts, $count_users, $count_plugins);
+
+    if ($plugin_updates > 0 || $themes_with_updates > 0 || $core_updates > 0) {
+      $summary_points[] = sprintf('Update queue: %d plugin(s), %d theme(s), and %s WordPress core updates awaiting review.', $plugin_updates, $themes_with_updates, $core_updates > 0 ? (string) $core_updates : __('no', 'visible-light'));
+    } else {
+      $summary_points[] = __('All tracked plugins, themes, and WordPress core are reported as current.', 'visible-light');
+    }
+
+    if ($tls_valid === true) {
+      $summary_points[] = $tls_expires !== ''
+        ? sprintf('TLS certificate is confirmed active through %s (%s).', $tls_expires, $tls_provider ?: __('issuer unknown', 'visible-light'))
+        : __('TLS certificate is confirmed active.', 'visible-light');
+    } elseif ($tls_valid === false) {
+      $summary_points[] = __('TLS status needs attention—no valid certificate details are recorded in Hub.', 'visible-light');
+    }
+
+    $key_findings   = [];
+    $key_findings[] = 'Infrastructure & Platform:';
+    $key_findings[] = sprintf('  • WordPress %s with %s as the active theme.', $wp_version !== '' ? $wp_version : __('version unknown', 'visible-light'), $active_theme !== '' ? $active_theme : __('theme not identified', 'visible-light'));
+    $key_findings[] = sprintf('  • %d active plugin integrations (top entries: %s).', count($active_plugins), $active_plugins ? implode(', ', $active_plugins) : __('not captured', 'visible-light'));
+    $key_findings[] = sprintf('  • Hosting endpoint resolved as %s with HTTPS %s.', $host, $https_status ? __('enabled', 'visible-light') : __('disabled or unverified', 'visible-light'));
+
+    $key_findings[] = 'Security & Compliance:';
+    if ($tls_valid === true) {
+      $key_findings[] = sprintf('  • TLS certificate active%s.', $tls_expires !== '' ? ' (expires ' . $tls_expires . ')' : '');
+    } else {
+      $key_findings[] = '  • TLS certificate validity requires confirmation.';
+    }
+    $key_findings[] = $waf_provider !== ''
+      ? sprintf('  • Web application firewall provided by %s%s.', $waf_provider, $waf_last_audit !== '' ? ' (last audit ' . $waf_last_audit . ')' : '')
+      : '  • No WAF provider is documented in the Hub profile.';
+    $key_findings[] = $ids_provider !== ''
+      ? sprintf('  • Threat protection by %s%s%s.', $ids_provider, $ids_last_scan !== '' ? ', last scan ' . $ids_last_scan : '', $ids_schedule !== '' ? ', schedule ' . $ids_schedule : '')
+      : '  • No intrusion detection telemetry is synced.';
+    if ($mfa !== '' || $password_policy !== '' || $session_timeout !== '' || $sso_providers !== '') {
+      $auth_details = array_filter([
+        $mfa !== '' ? 'MFA: ' . $mfa : '',
+        $password_policy !== '' ? 'Password policy: ' . $password_policy : '',
+        $session_timeout !== '' ? 'Session timeout: ' . $session_timeout : '',
+        $sso_providers !== '' ? 'SSO: ' . $sso_providers : '',
+      ]);
+      if ($auth_details) {
+        $key_findings[] = '  • Authentication controls — ' . implode('; ', $auth_details) . '.';
+      }
+    }
+
+    $key_findings[] = 'Content & Audience:';
+    $key_findings[] = sprintf('  • Hub indexes %d published pages and %d posts; top content includes %s.', $count_pages, $count_posts, $top_posts ? implode(', ', $top_posts) : __('(no titles provided)', 'visible-light'));
+    $key_findings[] = sprintf('  • %d total WordPress user accounts are registered.', $count_users);
+
+    $key_findings[] = 'Analytics & Signals:';
+    if ($ga4_metrics) {
+      $metric_lines = [];
+      foreach ($ga4_metrics as $metric_key => $metric_value) {
+        if ($metric_value === '' || $metric_value === null) {
+          continue;
+        }
+        $label = ucwords(str_replace(['_', '-'], ' ', (string) $metric_key));
+        $metric_lines[] = $label . ': ' . (is_scalar($metric_value) ? $metric_value : wp_json_encode($metric_value));
+        if (count($metric_lines) >= 4) {
+          break;
+        }
+      }
+      if ($metric_lines) {
+        $key_findings[] = '  • GA4 metrics (' . ($ga4_range !== '' ? $ga4_range : __('latest sync', 'visible-light')) . '): ' . implode('; ', $metric_lines) . '.';
+      }
+    } else {
+      $key_findings[] = '  • No GA4 analytics metrics have been synced for this property.';
+    }
+
+    $recommendations = [];
+    if ($plugin_updates > 0) {
+      $recommendations[] = sprintf('Schedule a maintenance window to apply %d pending plugin update(s); prioritize security-sensitive components first.', $plugin_updates);
+    }
+    if ($themes_with_updates > 0) {
+      $recommendations[] = sprintf('Review the %d theme update(s) awaiting deployment to maintain visual and security parity.', $themes_with_updates);
+    }
+    if ($core_updates > 0) {
+      $recommendations[] = 'Coordinate a WordPress core upgrade to the latest supported release to preserve platform supportability.';
+    }
+    if ($tls_valid !== true) {
+      $recommendations[] = 'Engage the infrastructure team to confirm certificate issuance and renewals for the production domain.';
+    }
+    if ($waf_provider === '') {
+      $recommendations[] = 'Evaluate adding a managed WAF service (e.g., Cloudflare or Fastly) to extend perimeter protection.';
+    }
+    if ($ids_provider === '') {
+      $recommendations[] = 'Introduce malware scanning or IDS coverage to close detection gaps across the application tier.';
+    }
+    if (empty($recommendations)) {
+      $recommendations[] = 'No immediate remediation is required based on the latest Hub telemetry. Maintain standard monitoring cadence.';
+    }
+
+    $snapshot   = [];
+    $snapshot[] = sprintf('Site URL: %s', $site_url);
+    if ($last_synced !== '') {
+      $snapshot[] = 'Profile last synced: ' . $last_synced;
+    }
+    $snapshot[] = sprintf('WordPress version: %s', $wp_version !== '' ? $wp_version : __('unknown', 'visible-light'));
+    if ($active_theme !== '') {
+      $snapshot[] = 'Active theme: ' . $active_theme;
+    }
+    $snapshot[] = sprintf('Active plugins: %d', count($active_plugins));
+    $snapshot[] = sprintf('Pending updates — plugins: %d, themes: %d, core: %d', $plugin_updates, $themes_with_updates, $core_updates);
+    if ($tls_valid !== null) {
+      $snapshot[] = 'TLS valid: ' . ($tls_valid ? 'yes' : 'no');
+    }
+    if ($tls_expires !== '') {
+      $snapshot[] = 'TLS expires: ' . $tls_expires;
+    }
+    if ($waf_provider !== '') {
+      $snapshot[] = 'WAF provider: ' . $waf_provider;
+    }
+    if ($ids_provider !== '') {
+      $snapshot[] = 'IDS provider: ' . $ids_provider;
+    }
+    if ($ga4_range !== '') {
+      $snapshot[] = 'GA4 range: ' . $ga4_range;
+    }
+
+    $lines   = [];
+    $lines[] = 'Subject: ' . $client_name . ' – ' . ($prompt_trimmed !== '' ? $prompt_trimmed : __('Luna Compose Update', 'visible-light'));
+    $lines[] = '';
+    $lines[] = 'Team ' . $client_name . ',';
+    $lines[] = '';
+    $lines[] = sprintf('Thank you for your request regarding "%s." The summary below reflects the most recent telemetry synchronized from Visible Light Hub for %s.', $prompt_trimmed !== '' ? $prompt_trimmed : __('current operations', 'visible-light'), $site_url);
+    $lines[] = '';
+    $lines[] = 'Executive Summary';
+    $lines[] = '-----------------';
+    foreach ($summary_points as $point) {
+      $lines[] = '- ' . $point;
+    }
+    $lines[] = '';
+    $lines[] = 'Key Findings';
+    $lines[] = '------------';
+    foreach ($key_findings as $finding) {
+      $lines[] = $finding;
+    }
+    $lines[] = '';
+    $lines[] = 'Recommended Next Steps';
+    $lines[] = '-----------------------';
+    foreach ($recommendations as $recommendation) {
+      $lines[] = '- ' . $recommendation;
+    }
+    $lines[] = '';
+    $lines[] = 'Data Snapshot';
+    $lines[] = '-------------';
+    foreach ($snapshot as $item) {
+      $lines[] = '- ' . $item;
+    }
+    $lines[] = '';
+    if ($prompt_trimmed !== '') {
+      $lines[] = 'Prompt reference: ' . $prompt_trimmed;
+      $lines[] = '';
+    }
+    $lines[] = 'Please let me know if you would like this prepared as outbound client communication or if deeper analysis is required on any of the items above.';
+    $lines[] = '';
+    $lines[] = 'Regards,';
+    $lines[] = 'Luna Compose';
+
+    return implode("\n", $lines);
+  }
+}
+
+if (!function_exists('vl_luna_compose_rest_respond')) {
+  function vl_luna_compose_rest_respond(WP_REST_Request $request) {
+    $prompt = trim((string) $request->get_param('prompt'));
+    if ($prompt === '') {
+      return new WP_REST_Response(['error' => 'Prompt is required.'], 400);
+    }
+
+    $client_slug = $request->get_param('client');
+    if (!is_string($client_slug) || $client_slug === '') {
+      $client_slug = 'commonwealthhealthservices';
+    }
+
+    $force_refresh = filter_var($request->get_param('refresh'), FILTER_VALIDATE_BOOLEAN);
+
+    $profile = vl_luna_compose_resolve_profile($client_slug, $force_refresh);
+    if (is_wp_error($profile)) {
+      $status = (int) ($profile->get_error_data('status') ?? 500);
+      return new WP_REST_Response([
+        'error' => $profile->get_error_message(),
+        'code'  => $profile->get_error_code(),
+      ], $status);
+    }
+
+    $answer = vl_luna_compose_render_answer($prompt, $profile);
+
+    $meta = [
+      'client'  => isset($profile['client_name']) ? (string) $profile['client_name'] : '',
+      'site'    => isset($profile['home_url']) ? (string) $profile['home_url'] : '',
+      'license' => isset($profile['license_key']) ? (string) $profile['license_key'] : '',
+      'source'  => 'vl-hub compose',
+    ];
+    if (!empty($profile['profile_last_synced'])) {
+      $meta['profile_last_synced'] = $profile['profile_last_synced'];
+    } elseif (!empty($profile['last_updated'])) {
+      $meta['profile_last_synced'] = $profile['last_updated'];
+    }
+
+    return rest_ensure_response([
+      'answer' => $answer,
+      'meta'   => $meta,
+    ]);
+  }
+}
+
+add_action('rest_api_init', function () {
+  register_rest_route('luna_compose/v1', '/respond', [
+    'methods'             => \WP_REST_Server::CREATABLE,
+    'permission_callback' => '__return_true',
+    'callback'            => 'vl_luna_compose_rest_respond',
+    'args'                => [
+      'prompt'  => [
+        'type'     => 'string',
+        'required' => true,
+      ],
+      'client'  => [
+        'type'     => 'string',
+        'required' => false,
+      ],
+      'refresh' => [
+        'type'     => 'boolean',
+        'required' => false,
+      ],
+    ],
+  ]);
+});
+
