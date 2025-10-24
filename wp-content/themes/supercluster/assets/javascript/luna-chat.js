@@ -1,4 +1,7 @@
 (function(){
+  if (window.LunaComposerIntegrated) {
+    return;
+  }
   const ready = (fn) => {
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', fn, { once: true });
@@ -264,7 +267,65 @@
 
     updatePlaceholderState();
 
-    const promptsHost = document.querySelector('[data-luna-prompts]') || document.querySelector('.luna-canned-prompts');
+    const promptsHostCandidates = [
+      document.querySelector('[data-luna-prompts]'),
+      document.querySelector('.luna-canned-prompts'),
+      document.querySelector('#luna-canned'),
+      document.querySelector('.ai-canned-prompts'),
+    ].filter(Boolean);
+    let promptsHost = promptsHostCandidates.length ? promptsHostCandidates[0] : null;
+    if (!promptsHost) {
+      const firstLegacyPrompt = document.querySelector('[data-luna-prompt-item]');
+      if (firstLegacyPrompt) {
+        promptsHost = firstLegacyPrompt.closest('[data-luna-prompt-root]') || firstLegacyPrompt.parentElement;
+      }
+    }
+
+    const hydrateLegacyPrompts = (items) => {
+      let hydrated = false;
+      items.forEach((item) => {
+        if (!item || item.dataset.lunaPromptBound === 'true') {
+          return;
+        }
+        const prompt = item.getAttribute('data-luna-prompt') || item.textContent || '';
+        const normalized = prompt.replace(/\s+/g, ' ').trim();
+        if (normalized === '') {
+          return;
+        }
+        hydrated = true;
+        item.dataset.lunaPromptBound = 'true';
+        item.setAttribute('data-luna-prompt-ready', 'true');
+        if (!item.hasAttribute('role')) {
+          item.setAttribute('role', 'button');
+        }
+        if (!item.hasAttribute('tabindex')) {
+          item.tabIndex = 0;
+        }
+        item.setAttribute('aria-pressed', 'false');
+
+        const activate = () => {
+          if (activePromptButton && activePromptButton !== item) {
+            activePromptButton.setAttribute('aria-pressed', 'false');
+          }
+          activePromptButton = item;
+          item.setAttribute('aria-pressed', 'true');
+          setEditorText(normalized);
+        };
+
+        item.addEventListener('click', (event) => {
+          event.preventDefault();
+          activate();
+        });
+        item.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            activate();
+          }
+        });
+      });
+      return hydrated;
+    };
+
     const renderPrompts = (container, prompts) => {
       if (!container) {
         return;
@@ -292,14 +353,18 @@
       });
     };
 
-    if (promptsHost) {
-      if (!promptsHost.hasChildNodes()) {
-        renderPrompts(promptsHost, cannedDefaults);
+    const legacyHydrated = hydrateLegacyPrompts(Array.from((promptsHost || document).querySelectorAll('[data-luna-prompt-item]')));
+
+    if (!legacyHydrated) {
+      if (promptsHost) {
+        if (!promptsHost.hasChildNodes()) {
+          renderPrompts(promptsHost, cannedDefaults);
+        }
+      } else {
+        const wrapper = document.createElement('div');
+        renderPrompts(wrapper, cannedDefaults);
+        composer.parentNode.insertBefore(wrapper, composer);
       }
-    } else {
-      const wrapper = document.createElement('div');
-      renderPrompts(wrapper, cannedDefaults);
-      composer.parentNode.insertBefore(wrapper, composer);
     }
 
     window.lunaBootstrapped = true;
