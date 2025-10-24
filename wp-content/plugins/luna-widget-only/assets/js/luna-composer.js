@@ -304,17 +304,10 @@
         return;
       }
       const formatted = formatAnswer(answer || '');
-      const metaLines = [];
+      let metaBlock = '';
       if (meta && meta.source) {
-        metaLines.push(`Source: ${escapeHTML(meta.source)}`);
+        metaBlock = `<p class="luna-composer__meta">Source: ${escapeHTML(meta.source)}</p>`;
       }
-      if (meta && meta.account_label) {
-        metaLines.push(`Account: ${escapeHTML(meta.account_label)}`);
-      }
-      if (meta && meta.account_site) {
-        metaLines.push(`Site: ${escapeHTML(meta.account_site)}`);
-      }
-      const metaBlock = metaLines.map((line) => `<p class="luna-composer__meta">${line}</p>`).join('');
       responseNode.innerHTML = `<div class="luna-composer__answer">${formatted}</div>${metaBlock}`;
     };
 
