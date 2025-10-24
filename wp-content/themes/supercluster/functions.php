@@ -313,8 +313,8 @@ setTimeout(function(){
  * (Safe to keep; your plugin also registers it.)
  */
 add_filter( 'query_vars', function ( $vars ) {
-	$vars[] = 'luna_req_id';
-	return $vars;
+        $vars[] = 'luna_req_id';
+        return $vars;
 } );
 
 add_action('admin_init', function () {
