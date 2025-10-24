@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Luna Chat — Widget (Client)
  * Description: Floating chat widget + shortcode with conversation logging. Pulls client facts from Visible Light Hub and blends them with AI answers. Includes chat history hydration and Hub-gated REST endpoints.
- * Version:     1.6.0
+ * Version:     1.7.0
  * Author:      Visible Light
  * License:     GPLv2 or later
  */
@@ -12,7 +12,290 @@ if (!defined('ABSPATH')) exit;
 /* ============================================================
  * CONSTANTS & OPTIONS
  * ============================================================ */
-if (!defined('LUNA_WIDGET_PLUGIN_VERSION')) define('LUNA_WIDGET_PLUGIN_VERSION', '1.6.0');
+if (!defined('LUNA_WIDGET_PLUGIN_VERSION')) define('LUNA_WIDGET_PLUGIN_VERSION', '1.7.0');
+if (!defined('LUNA_WIDGET_OPT_COMPOSER_ENABLED')) define('LUNA_WIDGET_OPT_COMPOSER_ENABLED', 'luna_composer_enabled');
+if (!defined('LUNA_WIDGET_OPT_COMPOSER_ACCOUNT')) define('LUNA_WIDGET_OPT_COMPOSER_ACCOUNT', 'luna_composer_account');
+if (!defined('LUNA_WIDGET_ASSET_URL')) define('LUNA_WIDGET_ASSET_URL', plugin_dir_url(__FILE__));
+
+function luna_composer_default_prompts() {
+  $defaults = array(
+    array(
+      'label'  => 'What can Luna help me with?',
+      'prompt' => "Hey Luna! What can you help me with today?",
+    ),
+    array(
+      'label'  => 'Site health overview',
+      'prompt' => 'Can you give me a quick health check of my WordPress site?',
+    ),
+    array(
+      'label'  => 'Pending updates',
+      'prompt' => 'Do I have any plugin, theme, or WordPress core updates waiting?',
+    ),
+    array(
+      'label'  => 'Security status',
+      'prompt' => 'Is my SSL certificate active and are there any security concerns?',
+    ),
+    array(
+      'label'  => 'Content inventory',
+      'prompt' => 'How many pages and posts are on the site right now?',
+    ),
+    array(
+      'label'  => 'Help contact info',
+      'prompt' => 'Remind me how someone can contact our team for help.',
+    ),
+  );
+
+  return apply_filters('luna_composer_default_prompts', $defaults);
+}
+
+function luna_composer_hub_accounts() {
+  static $cached = null;
+  if ($cached !== null) {
+    return $cached;
+  }
+
+  $accounts = array();
+
+  if (!function_exists('get_option')) {
+    $cached = $accounts;
+    return $accounts;
+  }
+
+  $licenses = get_option('vl_licenses_registry', null);
+  if (!is_array($licenses) || empty($licenses)) {
+    if (is_multisite()) {
+      $licenses = get_site_option('vl_licenses_registry', array());
+    }
+  }
+
+  if (!is_array($licenses) || empty($licenses)) {
+    $licenses = array();
+  }
+
+  foreach ($licenses as $license_id => $row) {
+    $record = is_array($row) ? $row : array();
+
+    $license_key = '';
+    if (!empty($record['key'])) {
+      $license_key = (string) $record['key'];
+    } elseif (!empty($record['license_key'])) {
+      $license_key = (string) $record['license_key'];
+    } elseif (is_string($license_id)) {
+      $license_key = (string) $license_id;
+    }
+    $license_key = trim($license_key);
+    if ($license_key === '') {
+      continue;
+    }
+
+    $accounts[] = luna_composer_normalize_account($record, $license_key);
+  }
+
+  if (empty($accounts)) {
+    foreach (luna_composer_remote_accounts() as $remote_account) {
+      if (empty($remote_account['license'])) {
+        continue;
+      }
+      $accounts[] = luna_composer_normalize_account($remote_account, $remote_account['license']);
+    }
+  }
+
+  if (!empty($accounts)) {
+    $unique = array();
+    foreach ($accounts as $account) {
+      $license = isset($account['license']) ? trim((string) $account['license']) : '';
+      if ($license === '') {
+        continue;
+      }
+      if (!isset($unique[$license])) {
+        $unique[$license] = $account;
+      }
+    }
+    $accounts = array_values($unique);
+  }
+
+  usort($accounts, function ($a, $b) {
+    $a_demo = !empty($a['is_demo']);
+    $b_demo = !empty($b['is_demo']);
+    if ($a_demo !== $b_demo) {
+      return $a_demo ? -1 : 1;
+    }
+    return strcasecmp($a['label'], $b['label']);
+  });
+
+  $cached = apply_filters('luna_composer_hub_accounts', $accounts);
+  return $cached;
+}
+
+function luna_composer_find_account($license_key) {
+  $license_key = trim((string) $license_key);
+  if ($license_key === '') {
+    return null;
+  }
+
+  foreach (luna_composer_hub_accounts() as $account) {
+    if (!empty($account['license']) && hash_equals($account['license'], $license_key)) {
+      return $account;
+    }
+  }
+
+  return null;
+}
+
+function luna_composer_normalize_account($record, $fallback_license = '') {
+  $record = is_array($record) ? $record : array();
+  $license_key = '';
+  if (!empty($record['license'])) {
+    $license_key = (string) $record['license'];
+  } elseif (!empty($record['license_key'])) {
+    $license_key = (string) $record['license_key'];
+  } elseif (!empty($record['key'])) {
+    $license_key = (string) $record['key'];
+  } else {
+    $license_key = (string) $fallback_license;
+  }
+  $license_key = trim($license_key);
+
+  $label = '';
+  if (!empty($record['client_name'])) {
+    $label = (string) $record['client_name'];
+  } elseif (!empty($record['client'])) {
+    $label = (string) $record['client'];
+  } elseif (!empty($record['name'])) {
+    $label = (string) $record['name'];
+  } elseif (!empty($record['label'])) {
+    $label = (string) $record['label'];
+  }
+  if ($label === '') {
+    $label = $license_key;
+  }
+
+  $site = '';
+  if (!empty($record['site'])) {
+    $site = (string) $record['site'];
+  } elseif (!empty($record['site_url'])) {
+    $site = (string) $record['site_url'];
+  } elseif (!empty($record['url'])) {
+    $site = (string) $record['url'];
+  }
+  $site = trim($site);
+
+  $status = '';
+  if (!empty($record['status'])) {
+    $status = strtolower((string) $record['status']);
+  } elseif (isset($record['active'])) {
+    $status = $record['active'] ? 'active' : 'inactive';
+  }
+
+  $is_demo = false;
+  if (!empty($record['demo'])) {
+    $is_demo = (bool) $record['demo'];
+  } elseif (!empty($record['is_demo'])) {
+    $is_demo = (bool) $record['is_demo'];
+  } elseif ($status === 'demo') {
+    $is_demo = true;
+  } elseif (stripos($label, 'demo') !== false) {
+    $is_demo = true;
+  }
+
+  return array(
+    'id'      => sanitize_title($license_key . '-' . $label),
+    'label'   => $label,
+    'license' => $license_key,
+    'site'    => $site,
+    'status'  => $status,
+    'is_demo' => $is_demo,
+  );
+}
+
+function luna_composer_remote_accounts() {
+  static $remote_cache = null;
+  if ($remote_cache !== null) {
+    return $remote_cache;
+  }
+
+  if (!function_exists('wp_remote_get')) {
+    $remote_cache = array();
+    return $remote_cache;
+  }
+
+  $candidates = array();
+
+  $rest_url = function_exists('rest_url') ? rest_url('vl-hub/v1/clients') : '';
+  if (is_string($rest_url) && $rest_url !== '') {
+    $candidates[] = $rest_url;
+  }
+
+  $hub_base = luna_widget_hub_base();
+  if (is_string($hub_base) && $hub_base !== '') {
+    $hub_endpoint = rtrim($hub_base, '/') . '/wp-json/vl-hub/v1/clients';
+    if (!in_array($hub_endpoint, $candidates, true)) {
+      $candidates[] = $hub_endpoint;
+    }
+  }
+
+  $user_agent = sprintf('LunaComposer/%s; %s', LUNA_WIDGET_PLUGIN_VERSION, home_url('/'));
+  $args = array(
+    'timeout'   => 15,
+    'headers'   => array(
+      'Accept'     => 'application/json',
+      'User-Agent' => $user_agent,
+    ),
+    'sslverify' => apply_filters('luna_composer_remote_accounts_sslverify', true),
+  );
+
+  $normalized = array();
+
+  foreach ($candidates as $endpoint) {
+    $response = wp_remote_get($endpoint, $args);
+
+    if (is_wp_error($response)) {
+      continue;
+    }
+
+    $code = (int) wp_remote_retrieve_response_code($response);
+    if ($code >= 400) {
+      continue;
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded)) {
+      continue;
+    }
+
+    if (isset($decoded['clients']) && is_array($decoded['clients'])) {
+      $decoded = $decoded['clients'];
+    }
+
+    foreach ($decoded as $record) {
+      if (!is_array($record)) {
+        continue;
+      }
+
+      $license = '';
+      if (!empty($record['license']) && is_string($record['license'])) {
+        $license = trim($record['license']);
+      } elseif (!empty($record['license_key']) && is_string($record['license_key'])) {
+        $license = trim($record['license_key']);
+      }
+
+      if ($license === '') {
+        continue;
+      }
+
+      $record['license'] = $license;
+      $normalized[] = $record;
+    }
+
+    if (!empty($normalized)) {
+      break;
+    }
+  }
+
+  $remote_cache = $normalized;
+  return $remote_cache;
+}
 
 define('LUNA_WIDGET_OPT_LICENSE',         'luna_widget_license');
 define('LUNA_WIDGET_OPT_MODE',            'luna_widget_mode');           // 'shortcode' | 'widget'
@@ -50,6 +333,9 @@ register_activation_hook(__FILE__, function () {
   if (!get_option(LUNA_WIDGET_OPT_LICENSE_SERVER, null)) {
     update_option(LUNA_WIDGET_OPT_LICENSE_SERVER, 'https://visiblelight.ai');
   }
+  if (get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, null) === null) {
+    update_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1');
+  }
   if (!wp_next_scheduled('luna_widget_heartbeat_event')) {
     wp_schedule_event(time() + 60, 'hourly', 'luna_widget_heartbeat_event');
   }
@@ -72,6 +358,14 @@ add_action('admin_menu', function () {
     'luna_widget_admin_page',
     'dashicons-format-chat',
     64
+  );
+  add_submenu_page(
+    'luna-widget',
+    'Compose',
+    'Compose',
+    'manage_options',
+    'luna-widget-compose',
+    'luna_widget_compose_admin_page'
   );
   add_submenu_page(
     'luna-widget',
@@ -167,6 +461,26 @@ add_action('admin_init', function () {
       );
     },
     'default' => array(),
+  ));
+
+  register_setting('luna_composer_settings', LUNA_WIDGET_OPT_COMPOSER_ENABLED, array(
+    'type' => 'string',
+    'sanitize_callback' => function($value) {
+      return $value === '1' ? '1' : '0';
+    },
+    'default' => '1',
+  ));
+  register_setting('luna_composer_settings', LUNA_WIDGET_OPT_COMPOSER_ACCOUNT, array(
+    'type' => 'string',
+    'sanitize_callback' => function($value) {
+      $value = trim((string) $value);
+      if ($value === '') {
+        return '';
+      }
+      $account = luna_composer_find_account($value);
+      return $account ? $account['license'] : '';
+    },
+    'default' => '',
   ));
 });
 
@@ -285,6 +599,167 @@ function luna_widget_admin_page(){
       });
     })();
   </script>
+  <?php
+}
+
+function luna_widget_compose_admin_page() {
+  if (!current_user_can('manage_options')) {
+    return;
+  }
+
+  $enabled = get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1') === '1';
+  $active_account = get_option(LUNA_WIDGET_OPT_COMPOSER_ACCOUNT, '');
+  $accounts = luna_composer_hub_accounts();
+  $history = luna_composer_recent_entries(10);
+  $canned  = get_posts(array(
+    'post_type'        => 'luna_canned_response',
+    'post_status'      => 'publish',
+    'numberposts'      => 10,
+    'orderby'          => array('menu_order' => 'ASC', 'title' => 'ASC'),
+    'order'            => 'ASC',
+    'suppress_filters' => false,
+  ));
+
+  ?>
+  <div class="wrap luna-composer-admin">
+    <h1>Luna Composer</h1>
+    <p class="description">Manage the Luna Composer experience alongside the floating widget without installing additional plugins.</p>
+
+    <form method="post" action="options.php" style="margin-bottom:2rem;">
+      <?php settings_fields('luna_composer_settings'); ?>
+      <table class="form-table" role="presentation">
+        <tr>
+          <th scope="row">Status</th>
+          <td>
+            <label>
+              <input type="checkbox" name="<?php echo esc_attr(LUNA_WIDGET_OPT_COMPOSER_ENABLED); ?>" value="1" <?php checked($enabled); ?> />
+              <?php esc_html_e('Activate Luna Composer front-end shortcode and REST handling', 'luna'); ?>
+            </label>
+            <p class="description">When disabled, the shortcode renders a notice and API requests return a friendly deactivation message.</p>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row"><?php esc_html_e('Default account', 'luna'); ?></th>
+          <td>
+            <?php if (!empty($accounts)) : ?>
+              <select name="<?php echo esc_attr(LUNA_WIDGET_OPT_COMPOSER_ACCOUNT); ?>" style="min-width:280px;">
+                <option value=""><?php esc_html_e('— Select an account for Composer —', 'luna'); ?></option>
+                <?php foreach ($accounts as $account) :
+                  $license = isset($account['license']) ? (string) $account['license'] : '';
+                  $label = isset($account['label']) ? (string) $account['label'] : $license;
+                  $site  = isset($account['site']) ? (string) $account['site'] : '';
+                  $status = isset($account['status']) ? (string) $account['status'] : '';
+                  $is_demo = !empty($account['is_demo']);
+                ?>
+                  <option value="<?php echo esc_attr($license); ?>" <?php selected($active_account, $license); ?>>
+                    <?php echo esc_html($label); ?><?php echo $site !== '' ? ' · ' . esc_html($site) : ''; ?><?php echo $is_demo ? ' · ' . esc_html__('Demo', 'luna') : ''; ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+              <p class="description">
+                <?php
+                $account_total = count($accounts);
+                printf(
+                  esc_html(_n(
+                    'Visible Light Hub detected %d account. Choose a default context for Composer responses or switch accounts from the interface.',
+                    'Visible Light Hub detected %d accounts. Choose a default context for Composer responses or switch accounts from the interface.',
+                    $account_total,
+                    'luna'
+                  )),
+                  $account_total
+                );
+                ?>
+              </p>
+            <?php else : ?>
+              <p style="margin-top:0;">
+                <?php esc_html_e('No Visible Light Hub accounts were detected. The Composer interface will offer a manual account field until a connection is established.', 'luna'); ?>
+              </p>
+              <p class="description">
+                <?php esc_html_e('Make sure the Visible Light Hub plugin is active and the site can reach the Hub clients endpoint.', 'luna'); ?>
+              </p>
+            <?php endif; ?>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Shortcode</th>
+          <td>
+            <code style="font-size:1.1em;">[luna_composer]</code>
+            <p class="description">Place this shortcode on any page or post to embed the Composer interface. It automatically shares canned prompts and the same REST endpoint as the Luna widget.</p>
+          </td>
+        </tr>
+      </table>
+      <?php submit_button(__('Save Composer Settings', 'luna')); ?>
+    </form>
+
+    <h2>Recent Composer History</h2>
+    <?php if (!empty($history)) : ?>
+      <ol class="luna-composer-history" style="max-width:900px;">
+        <?php foreach ($history as $entry) :
+          $prompt = get_post_meta($entry->ID, 'prompt', true);
+          $answer = get_post_meta($entry->ID, 'answer', true);
+          $timestamp = (int) get_post_meta($entry->ID, 'timestamp', true);
+          $meta = get_post_meta($entry->ID, 'meta', true);
+          $source = is_array($meta) && !empty($meta['source']) ? $meta['source'] : 'unknown';
+          $account_label = is_array($meta) && !empty($meta['account_label']) ? (string) $meta['account_label'] : '';
+          $account_site  = is_array($meta) && !empty($meta['account_site']) ? (string) $meta['account_site'] : '';
+          $time_display = $timestamp ? date_i18n(get_option('date_format') . ' ' . get_option('time_format'), $timestamp) : get_the_date('', $entry);
+          ?>
+          <li style="margin-bottom:1.5rem;padding:1rem;border:1px solid #dfe4ea;border-radius:8px;background:#fff;">
+            <strong><?php echo esc_html($time_display); ?></strong>
+            <?php if ($account_label !== '') : ?>
+              <div style="margin-top:.35rem;font-size:.9em;opacity:.85;">
+                <span style="font-weight:600;">Account:</span>
+                <span><?php echo esc_html($account_label); ?></span>
+                <?php if ($account_site !== '') : ?>
+                  <span style="display:block;"><?php echo esc_html($account_site); ?></span>
+                <?php endif; ?>
+              </div>
+            <?php endif; ?>
+            <div style="margin-top:.5rem;">
+              <span style="display:block;font-weight:600;">Prompt:</span>
+              <div style="margin-top:.35rem;white-space:pre-wrap;"><?php echo esc_html(wp_trim_words($prompt, 50, '…')); ?></div>
+            </div>
+            <div style="margin-top:.75rem;">
+              <span style="display:block;font-weight:600;">Response (<?php echo esc_html($source); ?>):</span>
+              <div style="margin-top:.35rem;white-space:pre-wrap;"><?php echo esc_html(wp_trim_words($answer, 120, '…')); ?></div>
+            </div>
+            <div style="margin-top:.5rem;font-size:.9em;">
+              <a href="<?php echo esc_url(get_edit_post_link($entry->ID)); ?>">View full entry</a>
+            </div>
+          </li>
+        <?php endforeach; ?>
+      </ol>
+    <?php else : ?>
+      <p>No composer history recorded yet.</p>
+    <?php endif; ?>
+
+    <h2>Canned Prompts &amp; Responses</h2>
+    <?php if (!empty($canned)) : ?>
+      <table class="widefat fixed striped" style="max-width:900px;">
+        <thead>
+          <tr>
+            <th scope="col">Prompt</th>
+            <th scope="col" style="width:35%;">Response preview</th>
+            <th scope="col" style="width:120px;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($canned as $post) :
+            $content = luna_widget_prepare_canned_response_content($post->post_content);
+            ?>
+            <tr>
+              <td><?php echo esc_html($post->post_title); ?></td>
+              <td><?php echo esc_html(wp_trim_words($content, 30, '…')); ?></td>
+              <td><a href="<?php echo esc_url(get_edit_post_link($post->ID)); ?>">Edit</a></td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+      <p style="margin-top:1rem;"><a class="button" href="<?php echo esc_url(admin_url('edit.php?post_type=luna_canned_response')); ?>">Manage canned responses</a></p>
+    <?php else : ?>
+      <p>No canned responses found. <a href="<?php echo esc_url(admin_url('post-new.php?post_type=luna_canned_response')); ?>">Create your first canned response</a> to provide offline answers when the Hub is unavailable.</p>
+    <?php endif; ?>
+  </div>
   <?php
 }
 
@@ -549,6 +1024,144 @@ add_action('init', function () {
   ));
 });
 
+/* ============================================================
+ * COMPOSER ENTRIES CPT (history)
+ * ============================================================ */
+add_action('init', function () {
+  $labels = array(
+    'name'          => __('Compose', 'luna'),
+    'singular_name' => __('Compose Entry', 'luna'),
+  );
+
+  register_post_type('luna_compose', array(
+    'labels'              => $labels,
+    'public'              => false,
+    'show_ui'             => false,
+    'show_in_menu'        => false,
+    'capability_type'     => 'post',
+    'map_meta_cap'        => true,
+    'supports'            => array('title'),
+  ));
+});
+
+/* ============================================================
+ * CANNED RESPONSES FALLBACK
+ * ============================================================ */
+add_action('init', function () {
+  $labels = array(
+    'name'               => __('Canned Responses', 'luna'),
+    'singular_name'      => __('Canned Response', 'luna'),
+    'add_new'            => __('Add New', 'luna'),
+    'add_new_item'       => __('Add New Canned Response', 'luna'),
+    'edit_item'          => __('Edit Canned Response', 'luna'),
+    'new_item'           => __('New Canned Response', 'luna'),
+    'view_item'          => __('View Canned Response', 'luna'),
+    'search_items'       => __('Search Canned Responses', 'luna'),
+    'not_found'          => __('No canned responses found.', 'luna'),
+    'not_found_in_trash' => __('No canned responses found in Trash.', 'luna'),
+    'menu_name'          => __('Canned Responses', 'luna'),
+  );
+
+  register_post_type('luna_canned_response', array(
+    'labels'              => $labels,
+    'public'              => false,
+    'show_ui'             => true,
+    'show_in_menu'        => 'luna-widget',
+    'show_in_rest'        => true,
+    'capability_type'     => 'post',
+    'map_meta_cap'        => true,
+    'supports'            => array('title', 'editor', 'revisions'),
+    'menu_icon'           => 'dashicons-text-page',
+    'menu_position'       => 26,
+  ));
+});
+
+function luna_widget_normalize_prompt_text($value) {
+  $value = is_string($value) ? $value : '';
+  $value = wp_strip_all_tags($value);
+  $value = html_entity_decode($value, ENT_QUOTES, get_option('blog_charset', 'UTF-8'));
+  $value = preg_replace('/\s+/u', ' ', $value);
+  return trim($value);
+}
+
+function luna_widget_prepare_canned_response_content($content) {
+  $content = (string) apply_filters('the_content', $content);
+  $content = str_replace(array("\r\n", "\r"), "\n", $content);
+  $content = preg_replace('/<\s*br\s*\/?\s*>/i', "\n", $content);
+  $content = preg_replace('/<\/(p|div|li|h[1-6])\s*>/i', '</$1>\n\n', $content);
+  $content = wp_strip_all_tags($content);
+  $content = html_entity_decode($content, ENT_QUOTES, get_option('blog_charset', 'UTF-8'));
+  $content = preg_replace("/\n{3,}/", "\n\n", $content);
+  return trim($content);
+}
+
+function luna_widget_find_canned_response($prompt) {
+  $normalized = luna_widget_normalize_prompt_text($prompt);
+  if ($normalized === '') {
+    return null;
+  }
+
+  $posts = get_posts(array(
+    'post_type'        => 'luna_canned_response',
+    'post_status'      => 'publish',
+    'numberposts'      => -1,
+    'orderby'          => array('menu_order' => 'ASC', 'title' => 'ASC'),
+    'order'            => 'ASC',
+    'suppress_filters' => false,
+  ));
+
+  if (empty($posts)) {
+    return null;
+  }
+
+  $normalized_lc = function_exists('mb_strtolower') ? mb_strtolower($normalized, 'UTF-8') : strtolower($normalized);
+  $best = null;
+  $best_score = 0.0;
+
+  foreach ($posts as $post) {
+    $title_normalized = luna_widget_normalize_prompt_text($post->post_title);
+    if ($title_normalized === '') {
+      continue;
+    }
+    $title_lc = function_exists('mb_strtolower') ? mb_strtolower($title_normalized, 'UTF-8') : strtolower($title_normalized);
+
+    if ($title_lc === $normalized_lc) {
+      return array(
+        'id'      => $post->ID,
+        'title'   => $post->post_title,
+        'content' => luna_widget_prepare_canned_response_content($post->post_content),
+      );
+    }
+
+    $score = 0.0;
+    if (function_exists('similar_text')) {
+      similar_text($normalized_lc, $title_lc, $percent);
+      $score = (float) $percent;
+    } elseif (function_exists('levenshtein')) {
+      $distance = levenshtein($normalized_lc, $title_lc);
+      $max_len = max(strlen($normalized_lc), strlen($title_lc), 1);
+      $score = 100.0 - (min($distance, $max_len) / $max_len * 100.0);
+    } else {
+      $score = strpos($normalized_lc, $title_lc) !== false || strpos($title_lc, $normalized_lc) !== false ? 100.0 : 0.0;
+    }
+
+    if ($score > $best_score) {
+      $best_score = $score;
+      $best = $post;
+    }
+  }
+
+  if ($best && $best_score >= 55.0) {
+    return array(
+      'id'      => $best->ID,
+      'title'   => $best->post_title,
+      'content' => luna_widget_prepare_canned_response_content($best->post_content),
+    );
+  }
+
+  return null;
+}
+
 function luna_widget_create_conversation_post($cid) {
   $pid = wp_insert_post(array(
     'post_type'   => 'luna_widget_convo',
@@ -616,9 +1229,53 @@ function luna_log_turn($user, $assistant, $meta = array()) {
   if (!is_array($t)) $t = array();
   $t[] = array('ts'=>time(), 'user'=>$user, 'assistant'=>$assistant, 'meta'=>$meta);
   update_post_meta($pid, 'transcript', $t);
-  
+
   // Also log to Hub
   luna_log_conversation_to_hub($t);
+}
+
+function luna_composer_log_entry($prompt, $answer, $meta = array(), $conversation_id = 0) {
+  $prompt = trim(wp_strip_all_tags((string) $prompt));
+  $answer = trim((string) $answer);
+  if ($prompt === '' && $answer === '') {
+    return 0;
+  }
+
+  $title = $prompt !== '' ? wp_trim_words($prompt, 12, '…') : __('Composer Entry', 'luna');
+  $post_id = wp_insert_post(array(
+    'post_type'   => 'luna_compose',
+    'post_title'  => $title,
+    'post_status' => 'publish',
+  ));
+
+  if (!$post_id || is_wp_error($post_id)) {
+    return 0;
+  }
+
+  update_post_meta($post_id, 'prompt', $prompt);
+  update_post_meta($post_id, 'answer', $answer);
+  update_post_meta($post_id, 'meta', is_array($meta) ? $meta : array());
+  if ($conversation_id) {
+    update_post_meta($post_id, 'conversation_post', (int) $conversation_id);
+  }
+  update_post_meta($post_id, 'timestamp', time());
+
+  return (int) $post_id;
+}
+
+function luna_composer_recent_entries($limit = 10) {
+  $query = new WP_Query(array(
+    'post_type'      => 'luna_compose',
+    'post_status'    => 'publish',
+    'posts_per_page' => max(1, (int) $limit),
+    'orderby'        => 'date',
+    'order'          => 'DESC',
+    'no_found_rows'  => true,
+  ));
+
+  $posts = $query->posts;
+  wp_reset_postdata();
+  return $posts;
 }
 
 /* Log conversation to Hub */
@@ -664,7 +1321,16 @@ function luna_log_conversation_to_hub($transcript) {
 /* ============================================================
  * HUB PROFILE FETCH (LICENSE-GATED) + FACTS
  * ============================================================ */
-function luna_get_license() { return trim((string) get_option(LUNA_WIDGET_OPT_LICENSE, '')); }
+function luna_get_license() {
+  if (!empty($GLOBALS['LUNA_LICENSE_OVERRIDE'])) {
+    $override = trim((string) $GLOBALS['LUNA_LICENSE_OVERRIDE']);
+    if ($override !== '') {
+      return $override;
+    }
+  }
+
+  return trim((string) get_option(LUNA_WIDGET_OPT_LICENSE, ''));
+}
 
 function luna_profile_cache_key() {
   $license = luna_get_license();
@@ -921,6 +1587,7 @@ function luna_profile_facts() {
       'core'    => $core_updates,
     ),
     'generated'  => gmdate('c'),
+    'comprehensive' => false,
   );
 
   if ($license) {
@@ -945,6 +1612,8 @@ function luna_profile_facts() {
     }
   }
 
+  $facts['__source'] = 'basic';
+
   return $facts;
 }
 
@@ -967,7 +1636,9 @@ function luna_profile_facts_comprehensive() {
   $license = luna_get_license();
   if (!$license) {
     error_log('[Luna] No license key found, falling back to basic facts');
-    return luna_profile_facts(); // fallback to basic facts
+    $fallback = luna_profile_facts(); // fallback to basic facts
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback;
   }
   
   // Try to fetch comprehensive data from VL Hub profile
@@ -984,7 +1655,9 @@ function luna_profile_facts_comprehensive() {
   
   if (is_wp_error($response)) {
     error_log('[Luna] Error fetching comprehensive data: ' . $response->get_error_message());
-    return luna_profile_facts(); // fallback
+    $fallback = luna_profile_facts();
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback; // fallback
   }
   
   $code = wp_remote_retrieve_response_code($response);
@@ -992,13 +1665,17 @@ function luna_profile_facts_comprehensive() {
   
   if ($code < 200 || $code >= 300) {
     error_log('[Luna] HTTP error, falling back to basic facts');
-    return luna_profile_facts(); // fallback
+    $fallback = luna_profile_facts();
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback; // fallback
   }
   
   $comprehensive = json_decode(wp_remote_retrieve_body($response), true);
   if (!is_array($comprehensive)) {
     error_log('[Luna] Invalid JSON response, falling back to basic facts');
-    return luna_profile_facts(); // fallback
+    $fallback = luna_profile_facts();
+    $fallback['__source'] = 'fallback-basic';
+    return $fallback; // fallback
   }
   
   error_log('[Luna] Successfully fetched comprehensive data: ' . print_r($comprehensive, true));
@@ -1218,6 +1895,8 @@ function luna_profile_facts_comprehensive() {
 
   error_log('[Luna] Built comprehensive facts: ' . print_r($facts, true));
 
+  $facts['__source'] = 'comprehensive';
+
   return $facts;
 }
 
@@ -1288,6 +1967,19 @@ function luna_snapshot_system() {
 /* ============================================================
  * FRONT-END: Widget/Shortcode + JS (with history hydrate)
  * ============================================================ */
+add_action('wp_enqueue_scripts', function () {
+  $accounts = luna_composer_hub_accounts();
+  $asset_rel = !empty($accounts) ? 'assets/js/luna-composer-hub.js' : 'assets/js/luna-composer.js';
+
+  wp_register_script(
+    'luna-composer',
+    LUNA_WIDGET_ASSET_URL . $asset_rel,
+    array(),
+    LUNA_WIDGET_PLUGIN_VERSION,
+    true
+  );
+});
+
 add_shortcode('luna_chat', function(){
   if (get_option(LUNA_WIDGET_OPT_MODE, 'widget') !== 'shortcode') {
     return '<!-- [luna_chat] disabled: floating widget active -->';
@@ -1301,6 +1993,133 @@ add_shortcode('luna_chat', function(){
     </form>
   </div>
   <?php return ob_get_clean();
+});
+
+add_shortcode('luna_composer', function($atts = array(), $content = '') {
+  $enabled = get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1') === '1';
+  if (!$enabled) {
+    return '<div class="luna-composer-disabled">' . esc_html__('Luna Composer is currently disabled.', 'luna') . '</div>';
+  }
+
+  $accounts = luna_composer_hub_accounts();
+  $active_account = get_option(LUNA_WIDGET_OPT_COMPOSER_ACCOUNT, '');
+
+  wp_enqueue_script('luna-composer');
+
+  static $composer_localized = false;
+  if (!$composer_localized) {
+    $prompts = array();
+    foreach (luna_composer_default_prompts() as $prompt) {
+      $label  = isset($prompt['label']) ? (string) $prompt['label'] : '';
+      $prompt_text = isset($prompt['prompt']) ? (string) $prompt['prompt'] : '';
+      if ($label === '' || $prompt_text === '') {
+        continue;
+      }
+      $prompts[] = array(
+        'label'  => sanitize_text_field($label),
+        'prompt' => wp_strip_all_tags($prompt_text),
+      );
+    }
+
+    $initial_account = '';
+    if (!empty($accounts)) {
+      $initial_account = trim((string) $active_account);
+      if ($initial_account === '') {
+        foreach ($accounts as $account) {
+          if (!empty($account['is_demo']) && !empty($account['license'])) {
+            $initial_account = (string) $account['license'];
+            break;
+          }
+        }
+      }
+      if ($initial_account === '' && !empty($accounts)) {
+        $first = reset($accounts);
+        if (!empty($first['license'])) {
+          $initial_account = (string) $first['license'];
+        }
+      }
+    }
+
+    $settings = array(
+      'restUrlChat' => esc_url_raw(rest_url('luna_widget/v1/chat')),
+      'nonce'       => is_user_logged_in() ? wp_create_nonce('wp_rest') : null,
+      'integrated'  => true,
+      'prompts'     => $prompts,
+    );
+
+    if (!empty($accounts)) {
+      $settings_accounts = array();
+      foreach ($accounts as $account) {
+        $license = isset($account['license']) ? trim((string) $account['license']) : '';
+        if ($license === '') {
+          continue;
+        }
+        $label  = isset($account['label']) ? sanitize_text_field($account['label']) : $license;
+        $site   = isset($account['site']) ? esc_url_raw($account['site']) : '';
+        $status = isset($account['status']) ? sanitize_text_field($account['status']) : '';
+
+        $settings_accounts[] = array(
+          'license' => $license,
+          'label'   => $label,
+          'site'    => $site,
+          'status'  => $status,
+          'isDemo'  => !empty($account['is_demo']),
+        );
+      }
+
+      if (!empty($settings_accounts)) {
+        $settings['accounts'] = $settings_accounts;
+        $settings['activeAccount'] = $initial_account;
+      }
+    }
+
+    wp_localize_script('luna-composer', 'lunaComposerSettings', $settings);
+    $composer_localized = true;
+  }
+
+  $id = esc_attr(wp_unique_id('luna-composer-'));
+  $placeholder = apply_filters('luna_composer_placeholder', __('Describe what you need from Luna…', 'luna'));
+  $inner_content = trim($content) !== '' ? do_shortcode($content) : '';
+
+  ob_start();
+  ?>
+  <div class="luna-composer" data-luna-composer data-luna-composer-id="<?php echo $id; ?>">
+    <div class="luna-composer__card">
+      <div class="luna-composer__header">
+        <h2><?php esc_html_e('Luna Composer', 'luna'); ?></h2>
+        <span style="font-size:0.9rem;opacity:.85;"><?php esc_html_e('Send structured requests to Luna', 'luna'); ?></span>
+      </div>
+      <?php if (!empty($accounts)) : ?>
+      <div class="luna-composer__account" data-luna-account-picker>
+        <label class="screen-reader-text" for="<?php echo esc_attr($id); ?>-account"><?php esc_html_e('Select account', 'luna'); ?></label>
+        <select id="<?php echo esc_attr($id); ?>-account" data-luna-composer-account></select>
+        <p class="luna-composer__account-meta" data-luna-composer-account-meta></p>
+      </div>
+      <?php endif; ?>
+      <div data-luna-prompts>
+        <?php echo $inner_content ? wp_kses_post($inner_content) : ''; ?>
+      </div>
+      <form class="luna-composer__form" action="#" method="post" novalidate>
+        <div
+          class="luna-composer__editor is-empty"
+          data-luna-composer-editor
+          contenteditable="true"
+          role="textbox"
+          aria-multiline="true"
+          spellcheck="true"
+          data-placeholder="<?php echo esc_attr($placeholder); ?>"
+        ></div>
+        <div class="luna-composer__actions">
+          <button type="submit" class="luna-composer__submit" data-luna-composer-submit>
+            <?php esc_html_e('Submit to Luna', 'luna'); ?>
+          </button>
+        </div>
+      </form>
+      <div class="luna-composer__response" data-luna-composer-response></div>
+    </div>
+  </div>
+  <?php
+  return ob_get_clean();
 });
 
 add_action('wp_footer', function () {
@@ -1984,13 +2803,69 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
     return new WP_REST_Response(array('answer'=>'Please enter a message.'), 200);
   }
 
+  $context = $req->get_param('context');
+  $context = is_string($context) ? sanitize_key($context) : '';
+  $is_composer = ($context === 'composer');
+  $composer_enabled = get_option(LUNA_WIDGET_OPT_COMPOSER_ENABLED, '1') === '1';
+  if ($is_composer && !$composer_enabled) {
+    return new WP_REST_Response(array(
+      'answer' => __('Luna Composer is currently disabled by an administrator.', 'luna'),
+      'meta'   => array('source' => 'system', 'composer' => false),
+    ), 200);
+  }
+
   $pid   = luna_conv_id();
+  $account_license = '';
+  $account_label   = '';
+  $account_site    = '';
+
+  if ($is_composer) {
+    $requested_license = trim((string) $req->get_param('license_override'));
+    if ($requested_license !== '') {
+      $nonce = (string) $req->get_header('X-WP-Nonce');
+      if ($nonce !== '' && wp_verify_nonce($nonce, 'wp_rest') && current_user_can('manage_options')) {
+        $account = luna_composer_find_account($requested_license);
+        if ($account) {
+          $account_license = isset($account['license']) ? trim((string) $account['license']) : '';
+          $account_label   = isset($account['label']) ? sanitize_text_field($account['label']) : '';
+          $account_site    = isset($account['site']) ? esc_url_raw($account['site']) : '';
+        }
+      }
+    }
+  }
+
+  $previous_override = isset($GLOBALS['LUNA_LICENSE_OVERRIDE']) ? $GLOBALS['LUNA_LICENSE_OVERRIDE'] : null;
+  if ($account_license !== '') {
+    $GLOBALS['LUNA_LICENSE_OVERRIDE'] = $account_license;
+  }
+
   $facts = luna_profile_facts_comprehensive(); // Use comprehensive Hub data
+
+  if ($account_license !== '') {
+    if ($previous_override !== null) {
+      $GLOBALS['LUNA_LICENSE_OVERRIDE'] = $previous_override;
+    } else {
+      unset($GLOBALS['LUNA_LICENSE_OVERRIDE']);
+    }
+  }
+
   $site_url = isset($facts['site_url']) ? (string)$facts['site_url'] : home_url('/');
   $security = isset($facts['security']) && is_array($facts['security']) ? $facts['security'] : array();
   $lc    = function_exists('mb_strtolower') ? mb_strtolower($prompt) : strtolower($prompt);
   $answer = '';
   $meta   = array('source' => 'deterministic');
+  if ($is_composer) {
+    $meta['composer'] = true;
+  }
+  if ($account_license !== '') {
+    $meta['account'] = $account_license;
+  }
+  if ($account_label !== '') {
+    $meta['account_label'] = $account_label;
+  }
+  if ($account_site !== '') {
+    $meta['account_site'] = $account_site;
+  }
 
   // Deterministic intents using comprehensive Hub data
   if (preg_match('/\b(tls|ssl|https|certificate|cert)\b/', $lc)) {
@@ -2229,6 +3104,21 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   }
 
   if ($answer === '') {
+    $facts_source = isset($facts['__source']) ? $facts['__source'] : ((isset($facts['comprehensive']) && $facts['comprehensive']) ? 'comprehensive' : 'basic');
+    if ($facts_source !== 'comprehensive') {
+      $canned = luna_widget_find_canned_response($prompt);
+      if (is_array($canned) && !empty($canned['content'])) {
+        $answer = $canned['content'];
+        $meta['source'] = 'canned_response';
+        $meta['canned_id'] = $canned['id'];
+        if (!empty($canned['title'])) {
+          $meta['canned_title'] = $canned['title'];
+        }
+      }
+    }
+  }
+
+  if ($answer === '') {
     $openai = luna_generate_openai_answer($pid, $prompt, $facts);
     if (is_array($openai) && !empty($openai['answer'])) {
       $answer = $openai['answer'];
@@ -2252,7 +3142,11 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   }
   luna_log_turn($prompt, $answer, $meta);
 
-  return new WP_REST_Response(array('answer'=>$answer), 200);
+  if ($is_composer) {
+    luna_composer_log_entry($prompt, $answer, $meta, $pid);
+  }
+
+  return new WP_REST_Response(array('answer'=>$answer, 'meta'=>$meta), 200);
 }
 
 function luna_widget_rest_chat_inactive( WP_REST_Request $req ) {
