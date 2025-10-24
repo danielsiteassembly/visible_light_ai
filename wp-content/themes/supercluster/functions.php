@@ -269,11 +269,11 @@ add_action('wp_enqueue_scripts', function () {
 			true
 		);
 
-		wp_localize_script($handle, 'lunaVars', [
-			'restUrlChat' => esc_url_raw(rest_url('luna/v1/chat')),       // existing CPT/polling flow
-			'restUrlLive' => esc_url_raw(rest_url('luna/v1/chat-live')),  // new live proxy
-			'nonce'       => wp_create_nonce('wp_rest'),
-		]);
+                wp_localize_script($handle, 'lunaVars', [
+                        'restUrlChat' => esc_url_raw(rest_url('luna_widget/v1/chat')),
+                        'restUrlLive' => esc_url_raw(rest_url('luna/v1/chat-live')),
+                        'nonce'       => wp_create_nonce('wp_rest'),
+                ]);
 
 		// Admin-only breadcrumb to confirm enqueue
 		if ( current_user_can( 'manage_options' ) ) {
