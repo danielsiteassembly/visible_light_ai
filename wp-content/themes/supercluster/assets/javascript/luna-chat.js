@@ -1,4 +1,7 @@
 (function(){
+  if (window.LunaComposerIntegrated) {
+    return;
+  }
   const ready = (fn) => {
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', fn, { once: true });
