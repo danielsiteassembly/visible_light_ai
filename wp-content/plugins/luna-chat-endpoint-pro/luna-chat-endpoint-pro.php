@@ -1769,7 +1769,6 @@ if (!function_exists('vl_luna_compose_resolve_profile')) {
         if (is_array($licenses)) {
           $licenses[$candidate] = [
             'key'         => $candidate,
-            'client'      => 'Commonwealth Health Services',
             'client_name' => 'Commonwealth Health Services',
             'site'        => 'https://commonwealthhealthservices.com',
             'status'      => 'active',

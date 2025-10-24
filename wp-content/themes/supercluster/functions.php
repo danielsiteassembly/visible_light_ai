@@ -276,11 +276,9 @@ add_action('wp_enqueue_scripts', function () {
 		);
 
                 wp_localize_script($handle, 'lunaVars', [
-                        'restUrlChat'    => esc_url_raw(rest_url('luna_widget/v1/chat')),
-                        'restUrlCompose' => esc_url_raw(rest_url('luna_compose/v1/respond')),
-                        'restUrlLive'    => esc_url_raw(rest_url('luna/v1/chat-live')),
-                        'composeClient'  => 'commonwealthhealthservices',
-                        'nonce'          => wp_create_nonce('wp_rest'),
+                        'restUrlChat' => esc_url_raw(rest_url('luna_widget/v1/chat')),
+                        'restUrlLive' => esc_url_raw(rest_url('luna/v1/chat-live')),
+                        'nonce'       => wp_create_nonce('wp_rest'),
                 ]);
 
 		// Admin-only breadcrumb to confirm enqueue
