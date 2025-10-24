@@ -36,6 +36,35 @@
       .luna-editor.is-empty:focus::before {
         color: var(--luna-placeholder-color, rgba(148, 163, 184, 0.85));
       }
+      .luna-canned-prompts {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 0.75rem;
+        margin-bottom: 1.25rem;
+      }
+      .luna-canned-prompts__button {
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 9999px;
+        background: rgba(15, 23, 42, 0.55);
+        color: inherit;
+        padding: 0.55rem 0.9rem;
+        font-size: 0.9rem;
+        line-height: 1.2;
+        text-align: left;
+        cursor: pointer;
+        transition: border-color 120ms ease, background-color 120ms ease, transform 120ms ease;
+      }
+      .luna-canned-prompts__button:hover,
+      .luna-canned-prompts__button:focus-visible {
+        border-color: rgba(99, 102, 241, 0.65);
+        background: rgba(79, 70, 229, 0.18);
+        outline: none;
+        transform: translateY(-1px);
+      }
+      .luna-canned-prompts__button[aria-pressed="true"] {
+        border-color: rgba(99, 102, 241, 0.85);
+        background: rgba(79, 70, 229, 0.28);
+      }
       #luna-response[data-loading="true"]::after {
         content: 'Thinking…';
         display: block;
@@ -49,17 +78,6 @@
       }
       #luna-response .luna-response__error {
         color: #fca5a5;
-      }
-      section.ai-canned-prompts#luna-canned [data-luna-prompt-item] {
-        cursor: pointer;
-      }
-      section.ai-canned-prompts#luna-canned [data-luna-prompt-item]:focus-visible {
-        outline: 2px solid rgba(99, 102, 241, 0.55);
-        outline-offset: 2px;
-      }
-      section.ai-canned-prompts#luna-canned [data-luna-prompt-item][data-luna-active="true"] {
-        outline: 2px solid rgba(99, 102, 241, 0.85);
-        outline-offset: 2px;
       }
     `;
     document.head.appendChild(style);
@@ -85,6 +103,33 @@
     return null;
   };
 
+  const cannedDefaults = [
+    {
+      label: 'What can Luna help me with?',
+      prompt: "Hey Luna! What can you help me with today?"
+    },
+    {
+      label: 'Site health overview',
+      prompt: 'Can you give me a quick health check of my WordPress site?'
+    },
+    {
+      label: 'Pending updates',
+      prompt: 'Do I have any plugin, theme, or WordPress core updates waiting?'
+    },
+    {
+      label: 'Security status',
+      prompt: 'Is my SSL certificate active and are there any security concerns?'
+    },
+    {
+      label: 'Content inventory',
+      prompt: 'How many pages and posts are on the site right now?'
+    },
+    {
+      label: 'Help contact info',
+      prompt: 'Remind me how someone can contact our team for help.'
+    }
+  ];
+
   const initComposer = () => {
     const composer = document.getElementById('luna-composer');
     const editor = composer ? composer.querySelector('#prompt-textarea') : null;
@@ -99,17 +144,8 @@
 
     const restUrl = resolveRestUrl();
     const nonce = resolveNonce();
-    let activePromptElement = null;
+    let activePromptButton = null;
     let submitting = false;
-
-    const clearActivePrompt = () => {
-      if (!activePromptElement) {
-        return;
-      }
-      activePromptElement.setAttribute('aria-pressed', 'false');
-      activePromptElement.removeAttribute('data-luna-active');
-      activePromptElement = null;
-    };
 
     const updatePlaceholderState = () => {
       const text = editor.textContent.replace(/\u00a0/g, ' ').trim();
@@ -199,7 +235,10 @@
         setTimeout(() => editor.classList.remove('luna-editor--invalid'), 600);
         return;
       }
-      clearActivePrompt();
+      if (activePromptButton) {
+        activePromptButton.setAttribute('aria-pressed', 'false');
+        activePromptButton = null;
+      }
       sendPrompt(value);
     };
 
@@ -207,7 +246,10 @@
 
     editor.addEventListener('input', () => {
       updatePlaceholderState();
-      clearActivePrompt();
+      if (activePromptButton) {
+        activePromptButton.setAttribute('aria-pressed', 'false');
+        activePromptButton = null;
+      }
     });
 
     editor.addEventListener('focus', updatePlaceholderState);
@@ -222,114 +264,43 @@
 
     updatePlaceholderState();
 
-    const handlePromptActivation = (element, prompt) => {
-      if (!prompt) {
+    const promptsHost = document.querySelector('[data-luna-prompts]') || document.querySelector('.luna-canned-prompts');
+    const renderPrompts = (container, prompts) => {
+      if (!container) {
         return;
       }
-      if (activePromptElement && activePromptElement !== element) {
-        activePromptElement.setAttribute('aria-pressed', 'false');
-        activePromptElement.removeAttribute('data-luna-active');
+      if (!container.classList.contains('luna-canned-prompts')) {
+        container.classList.add('luna-canned-prompts');
+        container.innerHTML = '';
       }
-      activePromptElement = element;
-      element.setAttribute('aria-pressed', 'true');
-      element.setAttribute('data-luna-active', 'true');
-      setEditorText(prompt);
-      sendPrompt(prompt);
-    };
-
-    const attachExistingCannedPrompts = () => {
-      const section = document.querySelector('section.ai-canned-prompts#luna-canned');
-      if (!section) {
-        return;
-      }
-
-      const rowSelectors = ['.columns-row-one', '.columns-row-two'];
-      const prepared = new Set();
-
-      const prepareNode = (node, promptText) => {
-        if (!(node instanceof HTMLElement)) {
-          return;
-        }
-        if (!promptText) {
-          return;
-        }
-        const normalizedPrompt = promptText.replace(/\s+/g, ' ').trim();
-        if (!normalizedPrompt) {
-          return;
-        }
-        if (prepared.has(node) || node.dataset.lunaPromptReady === 'true') {
-          return;
-        }
-
-        prepared.add(node);
-        node.dataset.lunaPromptItem = 'true';
-        node.dataset.lunaPrompt = normalizedPrompt;
-        node.dataset.lunaPromptReady = 'true';
-        if (!node.hasAttribute('aria-pressed')) {
-          node.setAttribute('aria-pressed', 'false');
-        }
-
-        if (!node.matches('button, a, input, textarea, select')) {
-          if (!node.hasAttribute('role')) {
-            node.setAttribute('role', 'button');
+      prompts.forEach(({ label, prompt }) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'luna-canned-prompts__button';
+        button.textContent = label;
+        button.setAttribute('data-prompt', prompt);
+        button.setAttribute('aria-pressed', 'false');
+        button.addEventListener('click', () => {
+          if (activePromptButton && activePromptButton !== button) {
+            activePromptButton.setAttribute('aria-pressed', 'false');
           }
-          if (!node.hasAttribute('tabindex')) {
-            node.tabIndex = 0;
-          }
-        }
-
-        const activate = (event) => {
-          if (event) {
-            event.preventDefault();
-          }
-          handlePromptActivation(node, normalizedPrompt);
-        };
-
-        node.addEventListener('click', activate);
-        node.addEventListener('keydown', (event) => {
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            activate(event);
-          }
+          activePromptButton = button;
+          button.setAttribute('aria-pressed', 'true');
+          setEditorText(prompt);
         });
-      };
-
-      rowSelectors.forEach((selector) => {
-        const row = section.querySelector(selector);
-        if (!row) {
-          return;
-        }
-
-        const columns = Array.from(row.querySelectorAll('.wp-block-column')).filter((col) => {
-          const parentRow = col.closest('.columns-row-one, .columns-row-two');
-          return parentRow === row;
-        });
-
-        const candidates = columns.length > 0 ? columns : Array.from(row.children);
-
-        candidates.forEach((candidate) => {
-          if (!(candidate instanceof HTMLElement)) {
-            return;
-          }
-
-          const interactive = candidate.matches('a, button')
-            ? candidate
-            : candidate.querySelector('a, button');
-
-          const target = (interactive instanceof HTMLElement && interactive.closest('.columns-row-one, .columns-row-two') === row)
-            ? interactive
-            : candidate;
-
-          const promptText = target.getAttribute('data-luna-prompt')
-            || target.getAttribute('data-prompt')
-            || target.textContent
-            || '';
-          prepareNode(target, promptText);
-        });
+        container.appendChild(button);
       });
     };
 
-    attachExistingCannedPrompts();
+    if (promptsHost) {
+      if (!promptsHost.hasChildNodes()) {
+        renderPrompts(promptsHost, cannedDefaults);
+      }
+    } else {
+      const wrapper = document.createElement('div');
+      renderPrompts(wrapper, cannedDefaults);
+      composer.parentNode.insertBefore(wrapper, composer);
+    }
 
     window.lunaBootstrapped = true;
   };
