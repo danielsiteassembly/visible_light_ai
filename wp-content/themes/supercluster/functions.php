@@ -212,106 +212,64 @@ function left_right_arrows() {
 }
 add_action( 'wp_enqueue_scripts', 'left_right_arrows' );
 
-/* === LUNA: conditionally load, admin-only debug breadcrumbs, localized REST vars === */
-add_action('wp_enqueue_scripts', function () {
-	if ( is_admin() ) return;
+/* === LUNA: conditionally load legacy theme script when present === */
+$luna_theme_script_rel_path  = '/assets/javascript/luna-chat.js';
+$luna_theme_script_full_path = get_stylesheet_directory() . $luna_theme_script_rel_path;
 
-	// Decide if we should load the chat
-	$should_load = false;
+if ( file_exists( $luna_theme_script_full_path ) ) {
+	add_action(
+		'wp_enqueue_scripts',
+		function () use ( $luna_theme_script_rel_path, $luna_theme_script_full_path ) {
+			if ( is_admin() ) {
+				return;
+			}
 
-	// Prefer plugin helper if available
-	if ( function_exists('luna_get_chat_mode') ) {
-		$mode = luna_get_chat_mode();
-		if ( $mode === 'widget' ) {
-			$should_load = true; // widget is site-wide
-		} else {
-			// Load only on pages that actually have the shortcode
-			$post_id = get_queried_object_id() ?: 0;
-			if ( $post_id && has_shortcode( get_post_field('post_content', $post_id), 'luna_chat' ) ) {
+			// If the plugin-based composer is active, it owns the front-end assets.
+			if ( shortcode_exists( 'luna_composer' ) || wp_script_is( 'luna-composer', 'registered' ) ) {
+				return;
+			}
+
+			$should_load = false;
+			$post_id     = get_queried_object_id() ?: 0;
+
+			if ( $post_id && has_shortcode( get_post_field( 'post_content', $post_id ), 'luna_chat' ) ) {
 				$should_load = true;
 			}
-		}
-	} else {
-		// Plugin not loaded yet? Fallback to shortcode detection only
-		$post_id = get_queried_object_id() ?: 0;
-		if ( $post_id && has_shortcode( get_post_field('post_content', $post_id), 'luna_chat' ) ) {
-			$should_load = true;
-		}
-	}
 
-        // Always load on the response route (/products/luna/chat/response/*)
-        $req_path = trim( $_SERVER['REQUEST_URI'] ?? '', '/' );
-        if ( strpos( $req_path, 'products/luna/chat/response' ) !== false ) {
-                $should_load = true;
-        }
+			$req_path = trim( $_SERVER['REQUEST_URI'] ?? '', '/' );
 
-        // The Luna composer page itself does not always use the shortcode, so also
-        // enqueue the script whenever the request path points at the Luna product hub.
-        if ( strpos( $req_path, 'products/luna' ) === 0 ) {
-                $should_load = true;
-        }
+			if ( strpos( $req_path, 'products/luna/chat/response' ) !== false || strpos( $req_path, 'products/luna' ) === 0 ) {
+				$should_load = true;
+			}
 
-	if ( ! $should_load ) return;
+			if ( ! $should_load ) {
+				return;
+			}
 
-	$handle      = 'luna-chat';
-	$rel_path    = '/assets/javascript/luna-chat.js';
-	$script_path = get_stylesheet_directory() . $rel_path;      // child theme path
-	$script_url  = get_stylesheet_directory_uri() . $rel_path;  // child theme URL
+			$handle     = 'luna-chat';
+			$script_url = get_stylesheet_directory_uri() . $luna_theme_script_rel_path;
 
-	// Admin-only debug breadcrumbs
-	if ( current_user_can( 'manage_options' ) ) {
-		add_action('wp_footer', function() use ($script_path) {
-			echo "\n<!-- LUNA DEBUG: target file path {$script_path} -->\n";
-			echo "<!-- LUNA DEBUG: current url " . esc_html($_SERVER['REQUEST_URI'] ?? '') . " -->\n";
-		}, 997);
-	}
+			wp_enqueue_script(
+				$handle,
+				$script_url,
+				[],
+				filemtime( $luna_theme_script_full_path ),
+				true
+			);
 
-	if ( file_exists( $script_path ) ) {
-		wp_enqueue_script(
-			$handle,
-			$script_url,
-			[],
-			filemtime( $script_path ),
-			true
-		);
-
-                wp_localize_script($handle, 'lunaVars', [
-                        'restUrlChat' => esc_url_raw(rest_url('luna_widget/v1/chat')),
-                        'restUrlLive' => esc_url_raw(rest_url('luna/v1/chat-live')),
-                        'nonce'       => wp_create_nonce('wp_rest'),
-                ]);
-
-		// Admin-only breadcrumb to confirm enqueue
-		if ( current_user_can( 'manage_options' ) ) {
-			add_action('wp_footer', function() use ($script_url) {
-				echo "\n<!-- LUNA DEBUG: enqueued {$script_url} -->\n";
-			}, 998);
-		}
-
-		// Tiny inline flag so we can tell if it ran
-		add_action('wp_footer', function () {
-			?>
-<script>
-window.__LUNA_EXPECTED__ = true;
-// If luna-chat.js runs, it should set window.lunaBootstrapped = true
-setTimeout(function(){
-	if (!window.lunaBootstrapped) {
-		console.warn('[LUNA] Script enqueued but not detected as running.');
-	}
-}, 1200);
-</script>
-			<?php
-		}, 999);
-
-	} else {
-		// Admin-only loud breadcrumb if file is missing
-		if ( current_user_can( 'manage_options' ) ) {
-			add_action('wp_footer', function() use ($script_path) {
-				echo "\n<!-- LUNA ERROR: JS file not found at {$script_path} -->\n";
-			}, 998);
-		}
-	}
-}, 99);
+			wp_localize_script(
+				$handle,
+				'lunaVars',
+				[
+					'restUrlChat' => esc_url_raw( rest_url( 'luna_widget/v1/chat' ) ),
+					'restUrlLive' => esc_url_raw( rest_url( 'luna/v1/chat-live' ) ),
+					'nonce'       => wp_create_nonce( 'wp_rest' ),
+				]
+			);
+		},
+		99
+	);
+}
 
 
 /**

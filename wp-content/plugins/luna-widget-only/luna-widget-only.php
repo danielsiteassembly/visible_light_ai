@@ -1004,7 +1004,16 @@ function luna_log_conversation_to_hub($transcript) {
 /* ============================================================
  * HUB PROFILE FETCH (LICENSE-GATED) + FACTS
  * ============================================================ */
-function luna_get_license() { return trim((string) get_option(LUNA_WIDGET_OPT_LICENSE, '')); }
+function luna_get_license() {
+  if (!empty($GLOBALS['LUNA_LICENSE_OVERRIDE'])) {
+    $override = trim((string) $GLOBALS['LUNA_LICENSE_OVERRIDE']);
+    if ($override !== '') {
+      return $override;
+    }
+  }
+
+  return trim((string) get_option(LUNA_WIDGET_OPT_LICENSE, ''));
+}
 
 function luna_profile_cache_key() {
   $license = luna_get_license();
@@ -2429,7 +2438,40 @@ function luna_widget_chat_handler( WP_REST_Request $req ) {
   }
 
   $pid   = luna_conv_id();
+  $account_license = '';
+  $account_label   = '';
+  $account_site    = '';
+
+  if ($is_composer) {
+    $requested_license = trim((string) $req->get_param('license_override'));
+    if ($requested_license !== '') {
+      $nonce = (string) $req->get_header('X-WP-Nonce');
+      if ($nonce !== '' && wp_verify_nonce($nonce, 'wp_rest') && current_user_can('manage_options')) {
+        $account = luna_composer_find_account($requested_license);
+        if ($account) {
+          $account_license = isset($account['license']) ? trim((string) $account['license']) : '';
+          $account_label   = isset($account['label']) ? sanitize_text_field($account['label']) : '';
+          $account_site    = isset($account['site']) ? esc_url_raw($account['site']) : '';
+        }
+      }
+    }
+  }
+
+  $previous_override = isset($GLOBALS['LUNA_LICENSE_OVERRIDE']) ? $GLOBALS['LUNA_LICENSE_OVERRIDE'] : null;
+  if ($account_license !== '') {
+    $GLOBALS['LUNA_LICENSE_OVERRIDE'] = $account_license;
+  }
+
   $facts = luna_profile_facts_comprehensive(); // Use comprehensive Hub data
+
+  if ($account_license !== '') {
+    if ($previous_override !== null) {
+      $GLOBALS['LUNA_LICENSE_OVERRIDE'] = $previous_override;
+    } else {
+      unset($GLOBALS['LUNA_LICENSE_OVERRIDE']);
+    }
+  }
+
   $site_url = isset($facts['site_url']) ? (string)$facts['site_url'] : home_url('/');
   $security = isset($facts['security']) && is_array($facts['security']) ? $facts['security'] : array();
   $lc    = function_exists('mb_strtolower') ? mb_strtolower($prompt) : strtolower($prompt);
