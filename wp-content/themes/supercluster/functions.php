@@ -239,11 +239,17 @@ add_action('wp_enqueue_scripts', function () {
 		}
 	}
 
-	// Always load on the response route (/products/luna/chat/response/*)
-	$req_path = trim( $_SERVER['REQUEST_URI'] ?? '', '/' );
-	if ( strpos( $req_path, 'products/luna/chat/response' ) !== false ) {
-		$should_load = true;
-	}
+        // Always load on the response route (/products/luna/chat/response/*)
+        $req_path = trim( $_SERVER['REQUEST_URI'] ?? '', '/' );
+        if ( strpos( $req_path, 'products/luna/chat/response' ) !== false ) {
+                $should_load = true;
+        }
+
+        // The Luna composer page itself does not always use the shortcode, so also
+        // enqueue the script whenever the request path points at the Luna product hub.
+        if ( strpos( $req_path, 'products/luna' ) === 0 ) {
+                $should_load = true;
+        }
 
 	if ( ! $should_load ) return;
 
